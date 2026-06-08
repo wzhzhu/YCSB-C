@@ -1,0 +1,855 @@
+#include "db/rocksdb_db.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <unordered_map>
+#include <utility>
+
+#include "cache/multi_level_cache.h"
+#include "cache/multi_level_cache_allocator.h"
+#include "cache/sr_hyper_clock_cache.h"
+#include "cache/arc_cache.h"
+#include "cache/cacheus_cache.h"
+#include "rocksdb/cache.h"
+#include "rocksdb/db.h"
+#include "rocksdb/filter_policy.h"
+#include "rocksdb/options.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/statistics.h"
+#include "rocksdb/table.h"
+
+namespace ycsbc {
+
+namespace {
+
+const char* kRocksdbDirKey = "rocksdb.dir";
+const char* kDefaultRocksdbDir = "/tmp/ycsbc-rocksdb";
+const char* kRocksdbSyncWriteKey = "rocksdb.sync_write";
+const char* kRocksdbCacheTypeKey = "rocksdb.cache_type";
+
+bool ParseBool(const utils::Properties& props, const std::string& key,
+               bool default_value) {
+  std::string value = props.GetProperty(key, default_value ? "true" : "false");
+  std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+  return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
+int ParseInt(const utils::Properties& props, const std::string& key,
+             int default_value) {
+  std::string value = props.GetProperty(key, std::to_string(default_value));
+  try {
+    return std::stoi(value);
+  } catch (...) {
+    return default_value;
+  }
+}
+
+uint64_t ParseUint64(const utils::Properties& props, const std::string& key,
+                     uint64_t default_value) {
+  std::string value = props.GetProperty(key, std::to_string(default_value));
+  try {
+    return static_cast<uint64_t>(std::stoull(value));
+  } catch (...) {
+    return default_value;
+  }
+}
+
+double ParseDouble(const utils::Properties& props, const std::string& key,
+                   double default_value) {
+  std::string value = props.GetProperty(key, std::to_string(default_value));
+  try {
+    return std::stod(value);
+  } catch (...) {
+    return default_value;
+  }
+}
+
+bool EndsWith(const std::string& value, const std::string& suffix) {
+  if (value.size() < suffix.size()) {
+    return false;
+  }
+  return value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+rocksdb::CompressionType ParseCompressionType(const std::string& name) {
+  std::string lower = name;
+  std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+  if (lower == "none" || lower == "no" || lower == "k nocompression") {
+    return rocksdb::kNoCompression;
+  }
+  if (lower == "snappy") {
+    return rocksdb::kSnappyCompression;
+  }
+  if (lower == "lz4") {
+    return rocksdb::kLZ4Compression;
+  }
+  if (lower == "zstd") {
+    return rocksdb::kZSTD;
+  }
+  return rocksdb::kNoCompression;
+}
+
+std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
+    const utils::Properties& props, size_t cache_capacity,
+    std::shared_ptr<rocksdb::MultiLevelCache>* out_multi_level_cache) {
+  const std::string cache_type =
+      props.GetProperty(kRocksdbCacheTypeKey, "lru_cache");
+  const int num_levels =
+      std::max(1, ParseInt(props, "rocksdb.num_levels", 7));
+  const bool force_l0 = ParseBool(
+      props, "rocksdb.multi_level_cache_force_route_all_to_l0", false);
+  const int cache_numshardbits = ParseInt(props, "rocksdb.cache_numshardbits", -1);
+  const bool strict_capacity_limit =
+      ParseBool(props, "rocksdb.cache_strict_capacity_limit", false);
+  const double high_pri_pool_ratio =
+      ParseDouble(props, "rocksdb.cache_high_pri_pool_ratio", 0.0);
+  const double low_pri_pool_ratio =
+      ParseDouble(props, "rocksdb.cache_low_pri_pool_ratio", 0.0);
+  const uint32_t cache_hash_seed =
+      static_cast<uint32_t>(ParseUint64(props, "rocksdb.cache_hash_seed", 0));
+
+  if (cache_type == "lru_cache") {
+    rocksdb::LRUCacheOptions lru_opts(
+        cache_capacity, cache_numshardbits, strict_capacity_limit,
+        high_pri_pool_ratio, nullptr, rocksdb::kDefaultToAdaptiveMutex,
+        rocksdb::kDefaultCacheMetadataChargePolicy, low_pri_pool_ratio);
+    lru_opts.hash_seed = cache_hash_seed;
+    auto cache = std::make_shared<rocksdb::MultiLevelCache>(
+        static_cast<size_t>(num_levels), cache_capacity, lru_opts, force_l0);
+    cache->SetSharedPoolRatio(
+        ParseDouble(props, "rocksdb.multi_level_cache_shared_pool_ratio", 0.0));
+    if (out_multi_level_cache != nullptr) {
+      *out_multi_level_cache = cache;
+    }
+    return cache;
+  }
+
+  if (cache_type == "cacheus_cache") {
+    rocksdb::CacheusTuningOptions tuning_opts;
+    tuning_opts.pending_max_age_ops = ParseUint64(
+        props, "rocksdb.cache_pending_max_age_ops", 65536);
+    rocksdb::LRUCacheOptions lru_opts(
+        cache_capacity, cache_numshardbits, strict_capacity_limit,
+        high_pri_pool_ratio, nullptr, rocksdb::kDefaultToAdaptiveMutex,
+        rocksdb::kDefaultCacheMetadataChargePolicy, low_pri_pool_ratio);
+    lru_opts.hash_seed = cache_hash_seed;
+    auto sub_cache_factory =
+        [lru_opts, tuning_opts](size_t level_capacity) mutable {
+          rocksdb::LRUCacheOptions per_level_opts = lru_opts;
+          per_level_opts.capacity = level_capacity;
+          return rocksdb::NewCacheusCache(per_level_opts, tuning_opts);
+        };
+    auto cache = std::make_shared<rocksdb::MultiLevelCache>(
+        static_cast<size_t>(num_levels), cache_capacity,
+        std::move(sub_cache_factory), force_l0);
+    cache->SetSharedPoolRatio(
+        ParseDouble(props, "rocksdb.multi_level_cache_shared_pool_ratio", 0.0));
+    if (out_multi_level_cache != nullptr) {
+      *out_multi_level_cache = cache;
+    }
+    return cache;
+  }
+
+  if (cache_type == "arc_cache") {
+    rocksdb::ARCTuningOptions tuning_opts;
+    tuning_opts.pending_max_age_ops = ParseUint64(
+        props, "rocksdb.cache_pending_max_age_ops", 65536);
+    rocksdb::LRUCacheOptions lru_opts(
+        cache_capacity, cache_numshardbits, strict_capacity_limit,
+        high_pri_pool_ratio, nullptr, rocksdb::kDefaultToAdaptiveMutex,
+        rocksdb::kDefaultCacheMetadataChargePolicy, low_pri_pool_ratio);
+    lru_opts.hash_seed = cache_hash_seed;
+    auto sub_cache_factory =
+        [lru_opts, tuning_opts](size_t level_capacity) mutable {
+          rocksdb::LRUCacheOptions per_level_opts = lru_opts;
+          per_level_opts.capacity = level_capacity;
+          return rocksdb::NewARCCache(per_level_opts, tuning_opts);
+        };
+    auto cache = std::make_shared<rocksdb::MultiLevelCache>(
+        static_cast<size_t>(num_levels), cache_capacity,
+        std::move(sub_cache_factory), force_l0);
+    cache->SetSharedPoolRatio(
+        ParseDouble(props, "rocksdb.multi_level_cache_shared_pool_ratio", 0.0));
+    if (out_multi_level_cache != nullptr) {
+      *out_multi_level_cache = cache;
+    }
+    return cache;
+  }
+
+  if (cache_type == "sr_hyper_clock_cache" ||
+      EndsWith(cache_type, "hyper_clock_cache")) {
+    size_t estimated_entry_charge = ParseUint64(
+        props, "rocksdb.hcc_estimated_entry_charge", 0);
+    if (cache_type == "fixed_hyper_clock_cache" && estimated_entry_charge == 0) {
+      estimated_entry_charge = 4096;
+    }
+    rocksdb::HyperClockCacheOptions hcc_opts(
+        cache_capacity, estimated_entry_charge, cache_numshardbits,
+        strict_capacity_limit);
+    hcc_opts.hash_seed = cache_hash_seed;
+    hcc_opts.probation_insert = (cache_type == "sr_hyper_clock_cache");
+
+    const int srhcc_start_level =
+        ParseInt(props, "rocksdb.multi_level_cache_srhcc_start_level", -1);
+    const bool mixed_srhcc = srhcc_start_level >= 0 &&
+                             srhcc_start_level < num_levels;
+    if (!mixed_srhcc) {
+      auto cache = std::make_shared<rocksdb::MultiLevelCache>(
+          static_cast<size_t>(num_levels), cache_capacity, hcc_opts, force_l0);
+      cache->SetSharedPoolRatio(
+          ParseDouble(props, "rocksdb.multi_level_cache_shared_pool_ratio", 0.0));
+      if (out_multi_level_cache != nullptr) {
+        *out_multi_level_cache = cache;
+      }
+      return cache;
+    }
+
+    const size_t level_count = static_cast<size_t>(num_levels);
+    const size_t per_level_capacity = force_l0 ? 0 : (cache_capacity / level_count);
+    const size_t remainder = force_l0 ? 0 : (cache_capacity % level_count);
+    std::vector<std::shared_ptr<rocksdb::Cache>> sub_caches;
+    sub_caches.reserve(level_count);
+    for (size_t level = 0; level < level_count; ++level) {
+      size_t level_capacity = per_level_capacity + (level < remainder ? 1 : 0);
+      if (force_l0 && level == 0) {
+        level_capacity = cache_capacity;
+      }
+      rocksdb::HyperClockCacheOptions per_level = hcc_opts;
+      per_level.capacity = std::max<size_t>(1, level_capacity);
+      if (level >= static_cast<size_t>(srhcc_start_level)) {
+        per_level.probation_insert = true;
+      }
+      sub_caches.emplace_back(per_level.MakeSharedCache());
+    }
+    rocksdb::HyperClockCacheOptions shared_opts = hcc_opts;
+    shared_opts.capacity = 1;
+    auto shared_cache = shared_opts.MakeSharedCache();
+    auto cache = std::make_shared<rocksdb::MultiLevelCache>(
+        std::move(sub_caches), std::move(shared_cache), cache_capacity);
+    cache->SetSharedPoolRatio(
+        ParseDouble(props, "rocksdb.multi_level_cache_shared_pool_ratio", 0.0));
+    if (out_multi_level_cache != nullptr) {
+      *out_multi_level_cache = cache;
+    }
+    return cache;
+  }
+
+  std::cerr << "[ycsbc-rocksdb] unsupported rocksdb.cache_type=" << cache_type
+            << ", fallback to lru_cache\n";
+  rocksdb::LRUCacheOptions fallback_opts(cache_capacity, cache_numshardbits,
+                                         strict_capacity_limit,
+                                         high_pri_pool_ratio);
+  fallback_opts.hash_seed = cache_hash_seed;
+  return fallback_opts.MakeSharedCache();
+}
+
+std::shared_ptr<rocksdb::Cache> CreateBlockCache(
+    const utils::Properties& props,
+    std::shared_ptr<rocksdb::MultiLevelCache>* out_multi_level_cache) {
+  if (ParseBool(props, "rocksdb.no_block_cache", false)) {
+    return nullptr;
+  }
+  const size_t cache_capacity = static_cast<size_t>(
+      ParseUint64(props, "rocksdb.block_cache_size_bytes", 32ULL << 20));
+  if (cache_capacity == 0) {
+    return nullptr;
+  }
+  if (ParseBool(props, "rocksdb.use_multi_level_cache", false)) {
+    return CreateMultiLevelCache(props, cache_capacity, out_multi_level_cache);
+  }
+
+  const std::string cache_type =
+      props.GetProperty(kRocksdbCacheTypeKey, "lru_cache");
+  const int cache_numshardbits = ParseInt(props, "rocksdb.cache_numshardbits", -1);
+  const bool strict_capacity_limit =
+      ParseBool(props, "rocksdb.cache_strict_capacity_limit", false);
+  const double high_pri_pool_ratio =
+      ParseDouble(props, "rocksdb.cache_high_pri_pool_ratio", 0.0);
+  const double low_pri_pool_ratio =
+      ParseDouble(props, "rocksdb.cache_low_pri_pool_ratio", 0.0);
+  const uint32_t cache_hash_seed =
+      static_cast<uint32_t>(ParseUint64(props, "rocksdb.cache_hash_seed", 0));
+
+  if (cache_type == "lru_cache") {
+    rocksdb::LRUCacheOptions lru_opts(
+        cache_capacity, cache_numshardbits, strict_capacity_limit,
+        high_pri_pool_ratio, nullptr, rocksdb::kDefaultToAdaptiveMutex,
+        rocksdb::kDefaultCacheMetadataChargePolicy, low_pri_pool_ratio);
+    lru_opts.hash_seed = cache_hash_seed;
+    return lru_opts.MakeSharedCache();
+  }
+
+  if (cache_type == "cacheus_cache") {
+    rocksdb::CacheusTuningOptions tuning_opts;
+    tuning_opts.pending_max_age_ops = ParseUint64(
+        props, "rocksdb.cache_pending_max_age_ops", 65536);
+    rocksdb::LRUCacheOptions lru_opts(
+        cache_capacity, cache_numshardbits, strict_capacity_limit,
+        high_pri_pool_ratio, nullptr, rocksdb::kDefaultToAdaptiveMutex,
+        rocksdb::kDefaultCacheMetadataChargePolicy, low_pri_pool_ratio);
+    lru_opts.hash_seed = cache_hash_seed;
+    return rocksdb::NewCacheusCache(lru_opts, tuning_opts);
+  }
+
+  if (cache_type == "arc_cache") {
+    rocksdb::ARCTuningOptions tuning_opts;
+    tuning_opts.pending_max_age_ops = ParseUint64(
+        props, "rocksdb.cache_pending_max_age_ops", 65536);
+    rocksdb::LRUCacheOptions lru_opts(
+        cache_capacity, cache_numshardbits, strict_capacity_limit,
+        high_pri_pool_ratio, nullptr, rocksdb::kDefaultToAdaptiveMutex,
+        rocksdb::kDefaultCacheMetadataChargePolicy, low_pri_pool_ratio);
+    lru_opts.hash_seed = cache_hash_seed;
+    return rocksdb::NewARCCache(lru_opts, tuning_opts);
+  }
+
+  if (cache_type == "sr_hyper_clock_cache") {
+    rocksdb::HyperClockCacheOptions opts(cache_capacity, 0, cache_numshardbits,
+                                         strict_capacity_limit);
+    opts.hash_seed = cache_hash_seed;
+    return rocksdb::NewSRHyperClockCache(opts);
+  }
+
+  if (EndsWith(cache_type, "hyper_clock_cache")) {
+    size_t estimated_entry_charge = ParseUint64(
+        props, "rocksdb.hcc_estimated_entry_charge", 0);
+    if (cache_type == "fixed_hyper_clock_cache" && estimated_entry_charge == 0) {
+      estimated_entry_charge = 4096;
+    }
+    rocksdb::HyperClockCacheOptions opts(cache_capacity, estimated_entry_charge,
+                                         cache_numshardbits,
+                                         strict_capacity_limit);
+    opts.hash_seed = cache_hash_seed;
+    return opts.MakeSharedCache();
+  }
+
+  std::cerr << "[ycsbc-rocksdb] unsupported rocksdb.cache_type=" << cache_type
+            << ", fallback to lru_cache\n";
+  rocksdb::LRUCacheOptions fallback_opts(cache_capacity, cache_numshardbits,
+                                         strict_capacity_limit,
+                                         high_pri_pool_ratio);
+  fallback_opts.hash_seed = cache_hash_seed;
+  return fallback_opts.MakeSharedCache();
+}
+
+}  // namespace
+
+RocksdbDB::RocksdbDB(const utils::Properties& props) {
+  db_path_ = props.GetProperty(kRocksdbDirKey, kDefaultRocksdbDir);
+  sync_writes_ = ParseBool(props, kRocksdbSyncWriteKey, false);
+  raw_kv_mode_ = ParseBool(props, "rocksdb.raw_kv_mode", false);
+  raw_key_size_bytes_ = static_cast<size_t>(
+      std::max<uint64_t>(1, ParseUint64(props, "rocksdb.raw_key_size_bytes", 24)));
+  raw_value_size_bytes_ = static_cast<size_t>(std::max<uint64_t>(
+      1, ParseUint64(props, "rocksdb.raw_value_size_bytes", 1000)));
+  if (raw_kv_mode_) {
+    raw_value_template_.assign(raw_value_size_bytes_, 'v');
+  }
+
+  rocksdb::Options options;
+  options.create_if_missing = ParseBool(props, "rocksdb.create_if_missing", true);
+  options.error_if_exists = ParseBool(props, "rocksdb.error_if_exists", false);
+  options.write_buffer_size =
+      static_cast<size_t>(ParseUint64(props, "rocksdb.write_buffer_size", 64ULL << 20));
+  options.max_background_jobs = ParseInt(props, "rocksdb.max_background_jobs", 4);
+  options.max_open_files = ParseInt(props, "rocksdb.max_open_files", -1);
+  options.target_file_size_base = static_cast<uint64_t>(
+      ParseUint64(props, "rocksdb.target_file_size_base", 64ULL << 20));
+  options.compression = ParseCompressionType(
+      props.GetProperty("rocksdb.compression", "none"));
+  options.use_direct_reads = ParseBool(props, "rocksdb.use_direct_reads", false);
+  options.allow_mmap_reads = ParseBool(props, "rocksdb.allow_mmap_reads", false);
+  options.statistics = rocksdb::CreateDBStatistics();
+  statistics_ = options.statistics;
+
+  if (ParseBool(props, "rocksdb.optimize_level_style_compaction", true)) {
+    options.OptimizeLevelStyleCompaction();
+  }
+  if (ParseBool(props, "rocksdb.increase_parallelism", true)) {
+    const int parallelism = std::max(
+        1, ParseInt(props, "rocksdb.parallelism", 0));
+    options.IncreaseParallelism(parallelism);
+  }
+
+  rocksdb::BlockBasedTableOptions table_options;
+  table_options.no_block_cache = ParseBool(props, "rocksdb.no_block_cache", false);
+  table_options.block_cache = CreateBlockCache(props, &multi_level_cache_);
+  block_cache_ = table_options.block_cache;
+  table_options.cache_index_and_filter_blocks =
+      ParseBool(props, "rocksdb.cache_index_and_filter_blocks", false);
+  table_options.cache_index_and_filter_blocks_with_high_priority =
+      ParseBool(props, "rocksdb.cache_index_and_filter_blocks_with_high_priority",
+                false);
+  table_options.pin_l0_filter_and_index_blocks_in_cache = ParseBool(
+      props, "rocksdb.pin_l0_filter_and_index_blocks_in_cache", false);
+  table_options.block_size = ParseUint64(props, "rocksdb.block_size", 4096);
+
+  const int bloom_bits = ParseInt(props, "rocksdb.bloom_bits_per_key", 0);
+  if (bloom_bits > 0) {
+    table_options.filter_policy.reset(
+        rocksdb::NewBloomFilterPolicy(static_cast<double>(bloom_bits), false));
+  }
+
+  options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
+
+  rocksdb::Status s = rocksdb::DB::Open(options, db_path_, &db_);
+  if (!s.ok()) {
+    std::cerr << "[ycsbc-rocksdb] open failed: " << s.ToString() << " path="
+              << db_path_ << "\n";
+    db_.reset();
+    multi_level_cache_.reset();
+    block_cache_.reset();
+    return;
+  }
+
+  const bool enable_allocator =
+      ParseBool(props, "rocksdb.multi_level_cache_auto_adjust", false);
+  if (enable_allocator && multi_level_cache_ != nullptr) {
+    rocksdb::MultiLevelAllocationOptions alloc_opts;
+    alloc_opts.interval_ms = static_cast<uint64_t>(
+        std::max(1, ParseInt(props, "rocksdb.multi_level_cache_adjust_interval_ms",
+                             1000)));
+    alloc_opts.smoothing_ratio =
+        ParseDouble(props, "rocksdb.multi_level_cache_adjust_smoothing_ratio",
+                    0.5);
+    alloc_opts.min_total_change_bytes = static_cast<size_t>(ParseUint64(
+        props, "rocksdb.multi_level_cache_adjust_min_change_bytes", 1ULL << 20));
+    alloc_opts.min_active_level_capacity_bytes = static_cast<size_t>(ParseUint64(
+        props, "rocksdb.multi_level_cache_adjust_min_active_level_capacity_bytes",
+        0));
+    alloc_opts.compaction_shift_ratio = ParseDouble(
+        props, "rocksdb.multi_level_cache_compaction_shift_ratio", 0.0);
+    alloc_opts.compaction_shift_max_total_ratio = ParseDouble(
+        props, "rocksdb.multi_level_cache_compaction_shift_max_total_ratio",
+        0.1);
+    alloc_opts.compaction_shift_debug = ParseBool(
+        props, "rocksdb.multi_level_cache_compaction_shift_debug", false);
+
+    const std::string mode = props.GetProperty(
+        "rocksdb.multi_level_cache_allocator_mode", "model");
+    if (mode == "baseline_emulation") {
+      alloc_opts.mode = rocksdb::MultiLevelAllocatorMode::kBaselineEmulation;
+    } else {
+      alloc_opts.mode = rocksdb::MultiLevelAllocatorMode::kModel;
+    }
+
+    const std::string alpha_estimator = props.GetProperty(
+        "rocksdb.multi_level_cache_alpha_estimator", "constant_one");
+    const double alpha_floor = ParseDouble(
+        props, "rocksdb.multi_level_cache_alpha_floor", 1.0);
+    const double alpha_max = ParseDouble(
+        props, "rocksdb.multi_level_cache_alpha_max", 100.0);
+
+    multi_level_allocator_ = std::make_unique<rocksdb::MultiLevelCacheAllocator>(
+        multi_level_cache_,
+        [this, alpha_estimator, alpha_floor, alpha_max](
+            std::vector<double>* lambda, std::vector<double>* data,
+            std::vector<double>* alpha) {
+          if (multi_level_cache_ == nullptr || lambda == nullptr || data == nullptr ||
+              alpha == nullptr) {
+            return false;
+          }
+          const auto snapshot = multi_level_cache_->GetLevelMetricsSnapshot();
+          const size_t n = snapshot.lookups.size();
+          if (n == 0 || snapshot.hits.size() != n ||
+              snapshot.capacities.size() != n || snapshot.data_sizes.size() != n) {
+            return false;
+          }
+
+          if (prev_allocator_lookups_.size() != n) {
+            prev_allocator_lookups_.assign(n, 0);
+            prev_allocator_hits_.assign(n, 0);
+          }
+
+          lambda->assign(n, 0.0);
+          data->assign(n, 0.0);
+          alpha->assign(n, 1.0);
+          bool has_signal = false;
+          for (size_t i = 0; i < n; ++i) {
+            const uint64_t curr_l = snapshot.lookups[i];
+            const uint64_t curr_h = snapshot.hits[i];
+            const uint64_t delta_l =
+                curr_l >= prev_allocator_lookups_[i]
+                    ? curr_l - prev_allocator_lookups_[i]
+                    : curr_l;
+            const uint64_t delta_h =
+                curr_h >= prev_allocator_hits_[i] ? curr_h - prev_allocator_hits_[i]
+                                                  : curr_h;
+            prev_allocator_lookups_[i] = curr_l;
+            prev_allocator_hits_[i] = curr_h;
+
+            (*lambda)[i] = static_cast<double>(delta_l > 0 ? delta_l : 1);
+            double di = snapshot.data_sizes[i] > 0
+                            ? static_cast<double>(snapshot.data_sizes[i])
+                            : static_cast<double>(snapshot.capacities[i]);
+            if (di <= 0) {
+              di = 1.0;
+            }
+            (*data)[i] = di;
+
+            double ai = 1.0;
+            if (alpha_estimator == "robust_hit_rate") {
+              const double hr =
+                  delta_l > 0 ? static_cast<double>(delta_h) / delta_l : 0.0;
+              const double clipped = std::max(0.01, std::min(0.99, hr));
+              ai = 1.0 / clipped;
+            }
+            ai = std::max(alpha_floor, std::min(alpha_max, ai));
+            (*alpha)[i] = ai;
+            if (delta_l > 0 || snapshot.data_sizes[i] > 0) {
+              has_signal = true;
+            }
+          }
+          return has_signal;
+        },
+        alloc_opts);
+    multi_level_allocator_->Start();
+  }
+}
+
+RocksdbDB::~RocksdbDB() {
+  if (multi_level_allocator_ != nullptr) {
+    multi_level_allocator_->Stop();
+    multi_level_allocator_.reset();
+  }
+  if (statistics_ != nullptr) {
+    const uint64_t hits =
+        statistics_->getTickerCount(rocksdb::BLOCK_CACHE_HIT);
+    const uint64_t misses =
+        statistics_->getTickerCount(rocksdb::BLOCK_CACHE_MISS);
+    const uint64_t total = hits + misses;
+    const double hit_ratio = total > 0
+                                 ? (static_cast<double>(hits) /
+                                    static_cast<double>(total))
+                                 : 0.0;
+    std::cerr << "# Block cache stats" << std::endl;
+    std::cerr << "rocksdb\tcache_hit\t" << hits << std::endl;
+    std::cerr << "rocksdb\tcache_miss\t" << misses << std::endl;
+    std::cerr << "rocksdb\tcache_hit_ratio\t" << hit_ratio << std::endl;
+  }
+  if (multi_level_cache_ != nullptr) {
+    const auto snapshot = multi_level_cache_->GetLevelMetricsSnapshot();
+    uint64_t total_lookups = 0;
+    uint64_t total_hits = 0;
+    for (size_t i = 0; i < snapshot.lookups.size(); ++i) {
+      const uint64_t lookups = snapshot.lookups[i];
+      const uint64_t hits = snapshot.hits[i];
+      total_lookups += lookups;
+      total_hits += hits;
+      const double level_hit_ratio =
+          lookups > 0 ? static_cast<double>(hits) / static_cast<double>(lookups)
+                      : 0.0;
+      std::cerr << "rocksdb\tmlc_level_" << i << "_lookups\t" << lookups
+                << std::endl;
+      std::cerr << "rocksdb\tmlc_level_" << i << "_hits\t" << hits
+                << std::endl;
+      std::cerr << "rocksdb\tmlc_level_" << i << "_hit_ratio\t"
+                << level_hit_ratio << std::endl;
+    }
+    const double total_level_hit_ratio =
+        total_lookups > 0
+            ? static_cast<double>(total_hits) / static_cast<double>(total_lookups)
+            : 0.0;
+    std::cerr << "rocksdb\tmlc_total_lookups\t" << total_lookups << std::endl;
+    std::cerr << "rocksdb\tmlc_total_hits\t" << total_hits << std::endl;
+    std::cerr << "rocksdb\tmlc_total_hit_ratio\t" << total_level_hit_ratio
+              << std::endl;
+  }
+}
+
+void RocksdbDB::ResetStats() {
+  if (statistics_ != nullptr) {
+    statistics_->Reset();
+  }
+  if (multi_level_cache_ != nullptr) {
+    multi_level_cache_->ResetStats();
+  }
+}
+
+int RocksdbDB::Read(const std::string& table, const std::string& key,
+                    const std::vector<std::string>* fields,
+                    std::vector<KVPair>& result) {
+  result.clear();
+  if (!db_) {
+    return DB::kErrorConflict;
+  }
+
+  std::string value;
+  const rocksdb::Status s =
+      db_->Get(rocksdb::ReadOptions(),
+               BuildInternalKey(table, key, raw_kv_mode_, raw_key_size_bytes_),
+               &value);
+  if (s.IsNotFound()) {
+    return DB::kErrorNoData;
+  }
+  if (!s.ok()) {
+    return DB::kErrorConflict;
+  }
+
+  if (raw_kv_mode_) {
+    result.emplace_back("field0", value);
+    return DB::kOK;
+  }
+
+  std::vector<KVPair> decoded;
+  if (!DecodeRecord(value, &decoded)) {
+    return DB::kErrorConflict;
+  }
+  SelectFields(decoded, fields, &result);
+  return DB::kOK;
+}
+
+int RocksdbDB::Scan(const std::string& table, const std::string& key,
+                    int record_count, const std::vector<std::string>* fields,
+                    std::vector<std::vector<KVPair>>& result) {
+  result.clear();
+  if (!db_) {
+    return DB::kErrorConflict;
+  }
+
+  const std::string table_prefix = table;
+  const std::string start_key =
+      BuildInternalKey(table, key, raw_kv_mode_, raw_key_size_bytes_);
+  rocksdb::ReadOptions ro;
+  std::unique_ptr<rocksdb::Iterator> iter(db_->NewIterator(ro));
+
+  iter->Seek(start_key);
+  while (iter->Valid() && record_count > 0) {
+    const std::string internal_key = iter->key().ToString();
+    if (!raw_kv_mode_ && !StartsWith(internal_key, table_prefix)) {
+      break;
+    }
+    if (raw_kv_mode_) {
+      std::vector<KVPair> selected;
+      selected.emplace_back("field0", iter->value().ToString());
+      result.emplace_back(std::move(selected));
+      --record_count;
+      iter->Next();
+      continue;
+    }
+    std::vector<KVPair> decoded;
+    if (!DecodeRecord(iter->value().ToString(), &decoded)) {
+      return DB::kErrorConflict;
+    }
+    std::vector<KVPair> selected;
+    SelectFields(decoded, fields, &selected);
+    result.emplace_back(std::move(selected));
+    --record_count;
+    iter->Next();
+  }
+
+  if (!iter->status().ok()) {
+    return DB::kErrorConflict;
+  }
+  return DB::kOK;
+}
+
+int RocksdbDB::Update(const std::string& table, const std::string& key,
+                      std::vector<KVPair>& values) {
+  if (!db_) {
+    return DB::kErrorConflict;
+  }
+
+  const std::string internal_key =
+      BuildInternalKey(table, key, raw_kv_mode_, raw_key_size_bytes_);
+  std::string existing;
+  std::vector<KVPair> merged;
+
+  const rocksdb::Status get_s = db_->Get(rocksdb::ReadOptions(), internal_key, &existing);
+  if (get_s.ok()) {
+    if (raw_kv_mode_) {
+      rocksdb::WriteOptions wo;
+      wo.sync = sync_writes_;
+      const rocksdb::Status put_s = db_->Put(wo, internal_key, raw_value_template_);
+      return put_s.ok() ? DB::kOK : DB::kErrorConflict;
+    } else {
+      if (!DecodeRecord(existing, &merged)) {
+        return DB::kErrorConflict;
+      }
+    }
+  } else if (!get_s.IsNotFound()) {
+    return DB::kErrorConflict;
+  }
+
+  std::unordered_map<std::string, size_t> field_pos;
+  field_pos.reserve(merged.size() + values.size());
+  for (size_t i = 0; i < merged.size(); ++i) {
+    field_pos[merged[i].first] = i;
+  }
+  for (const auto& kv : values) {
+    auto it = field_pos.find(kv.first);
+    if (it == field_pos.end()) {
+      field_pos[kv.first] = merged.size();
+      merged.push_back(kv);
+    } else {
+      merged[it->second].second = kv.second;
+    }
+  }
+
+  rocksdb::WriteOptions wo;
+  wo.sync = sync_writes_;
+  const rocksdb::Status put_s =
+      db_->Put(wo, internal_key, EncodeRecord(merged));
+  return put_s.ok() ? DB::kOK : DB::kErrorConflict;
+}
+
+int RocksdbDB::Insert(const std::string& table, const std::string& key,
+                      std::vector<KVPair>& values) {
+  if (!db_) {
+    return DB::kErrorConflict;
+  }
+
+  const std::string internal_key =
+      BuildInternalKey(table, key, raw_kv_mode_, raw_key_size_bytes_);
+  std::string existing;
+  const rocksdb::Status get_s =
+      db_->Get(rocksdb::ReadOptions(), internal_key, &existing);
+  if (get_s.ok()) {
+    return DB::kErrorConflict;
+  }
+  if (!get_s.IsNotFound()) {
+    return DB::kErrorConflict;
+  }
+
+  rocksdb::WriteOptions wo;
+  wo.sync = sync_writes_;
+  const rocksdb::Status put_s = db_->Put(
+      wo, internal_key, raw_kv_mode_ ? raw_value_template_ : EncodeRecord(values));
+  return put_s.ok() ? DB::kOK : DB::kErrorConflict;
+}
+
+int RocksdbDB::Delete(const std::string& table, const std::string& key) {
+  if (!db_) {
+    return DB::kErrorConflict;
+  }
+
+  const std::string internal_key =
+      BuildInternalKey(table, key, raw_kv_mode_, raw_key_size_bytes_);
+  std::string existing;
+  const rocksdb::Status get_s =
+      db_->Get(rocksdb::ReadOptions(), internal_key, &existing);
+  if (get_s.IsNotFound()) {
+    return DB::kErrorNoData;
+  }
+  if (!get_s.ok()) {
+    return DB::kErrorConflict;
+  }
+
+  rocksdb::WriteOptions wo;
+  wo.sync = sync_writes_;
+  const rocksdb::Status del_s = db_->Delete(wo, internal_key);
+  return del_s.ok() ? DB::kOK : DB::kErrorConflict;
+}
+
+void RocksdbDB::AppendUint32(std::string* dst, uint32_t value) {
+  dst->push_back(static_cast<char>(value & 0xFF));
+  dst->push_back(static_cast<char>((value >> 8) & 0xFF));
+  dst->push_back(static_cast<char>((value >> 16) & 0xFF));
+  dst->push_back(static_cast<char>((value >> 24) & 0xFF));
+}
+
+bool RocksdbDB::ReadUint32(const std::string& src, size_t* pos, uint32_t* value) {
+  if (*pos + 4 > src.size()) {
+    return false;
+  }
+  const unsigned char b0 = static_cast<unsigned char>(src[*pos]);
+  const unsigned char b1 = static_cast<unsigned char>(src[*pos + 1]);
+  const unsigned char b2 = static_cast<unsigned char>(src[*pos + 2]);
+  const unsigned char b3 = static_cast<unsigned char>(src[*pos + 3]);
+  *value = static_cast<uint32_t>(b0) | (static_cast<uint32_t>(b1) << 8) |
+           (static_cast<uint32_t>(b2) << 16) |
+           (static_cast<uint32_t>(b3) << 24);
+  *pos += 4;
+  return true;
+}
+
+std::string RocksdbDB::EncodeRecord(const std::vector<KVPair>& fields) {
+  std::string encoded;
+  encoded.reserve(fields.size() * 32);
+  AppendUint32(&encoded, static_cast<uint32_t>(fields.size()));
+  for (const auto& kv : fields) {
+    AppendUint32(&encoded, static_cast<uint32_t>(kv.first.size()));
+    encoded.append(kv.first);
+    AppendUint32(&encoded, static_cast<uint32_t>(kv.second.size()));
+    encoded.append(kv.second);
+  }
+  return encoded;
+}
+
+bool RocksdbDB::DecodeRecord(const std::string& encoded,
+                             std::vector<KVPair>* fields) {
+  fields->clear();
+  size_t pos = 0;
+  uint32_t count = 0;
+  if (!ReadUint32(encoded, &pos, &count)) {
+    return false;
+  }
+  fields->reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t key_len = 0;
+    uint32_t val_len = 0;
+    if (!ReadUint32(encoded, &pos, &key_len)) {
+      return false;
+    }
+    if (pos + key_len > encoded.size()) {
+      return false;
+    }
+    std::string field = encoded.substr(pos, key_len);
+    pos += key_len;
+    if (!ReadUint32(encoded, &pos, &val_len)) {
+      return false;
+    }
+    if (pos + val_len > encoded.size()) {
+      return false;
+    }
+    std::string value = encoded.substr(pos, val_len);
+    pos += val_len;
+    fields->emplace_back(std::move(field), std::move(value));
+  }
+  return pos == encoded.size();
+}
+
+std::string RocksdbDB::BuildInternalKey(const std::string& table,
+                                        const std::string& key,
+                                        bool raw_kv_mode,
+                                        size_t raw_key_size_bytes) {
+  if (!raw_kv_mode) {
+    return table + key;
+  }
+  if (key.size() == raw_key_size_bytes) {
+    return key;
+  }
+  if (key.size() > raw_key_size_bytes) {
+    return key.substr(key.size() - raw_key_size_bytes);
+  }
+  return std::string(raw_key_size_bytes - key.size(), '0') + key;
+}
+
+bool RocksdbDB::StartsWith(const std::string& value, const std::string& prefix) {
+  if (value.size() < prefix.size()) {
+    return false;
+  }
+  return value.compare(0, prefix.size(), prefix) == 0;
+}
+
+void RocksdbDB::SelectFields(const std::vector<KVPair>& all_fields,
+                             const std::vector<std::string>* fields,
+                             std::vector<KVPair>* selected) {
+  selected->clear();
+  if (fields == nullptr) {
+    *selected = all_fields;
+    return;
+  }
+  selected->reserve(fields->size());
+  for (const auto& wanted : *fields) {
+    for (const auto& kv : all_fields) {
+      if (kv.first == wanted) {
+        selected->push_back(kv);
+        break;
+      }
+    }
+  }
+}
+
+}  // namespace ycsbc
