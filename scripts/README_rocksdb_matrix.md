@@ -7,7 +7,7 @@
 - 事务数：`operationcount=1000000`
 - block cache：`1GB,2GB,4GB,8GB`
 - 线程数：`8,16,32,64,128`
-- 对比策略：`lru,hcc,arc,cacheus,mlc_hcc_sr_bottom,mlc_hcc_all_levels`
+- 对比策略：`lru,hcc,arc,cacheus,mlc_hcc_sr_bottom,mlc_hcc_all_levels,mlc_hcc_dynamic_srhcc`
 - 其他固定项：
   - `rocksdb.raw_kv_mode=true`
   - `rocksdb.raw_key_size_bytes=24`
@@ -24,6 +24,16 @@
 >
 > 说明 1b：`mlc_hcc_all_levels` 对应“MLC 所有层都是 HCC（无 SR-HCC）”，通过  
 > `rocksdb.cache_type=hyper_clock_cache` + `rocksdb.use_multi_level_cache=true` + `rocksdb.multi_level_cache_srhcc_start_level=-1` 实现。
+>
+> 说明 1c：`mlc_hcc_dynamic_srhcc` 对应“MLC 默认全层 HCC，并按每层 scan 信号动态切换到 SR-HCC 风格（probation_insert）”。
+> 默认策略参数：
+> - `rocksdb.multi_level_cache_dynamic_srhcc_enable=true`
+> - `rocksdb.multi_level_cache_dynamic_srhcc_check_interval_ops=4096`
+> - `rocksdb.multi_level_cache_dynamic_srhcc_min_samples=12288`
+> - `rocksdb.multi_level_cache_dynamic_srhcc_sample_rate_log2=0`（全采样）
+> - `rocksdb.multi_level_cache_dynamic_srhcc_poll_interval_ms=100`
+> - `rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_enable_threshold=0.50`
+> - `rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_disable_threshold=0.30`
 >
 > 说明 2：`raw_kv_mode=true` 时，RocksDB backend 直接写固定长度 value，且 key 不再拼接 `table` 前缀，从而尽量贴合 `24B key + 1000B value`。
 
@@ -109,4 +119,7 @@
 - `read_throughput_kops`
 - `write_throughput_kops`
 - `avg_latency_ms` / `read_avg_latency_ms` / `write_avg_latency_ms`
-- `mlc_total_hit_ratio` 与 `mlc_metrics`（MLC 各层 lookups/hits/hit_ratio）
+- `mlc_total_hit_ratio`
+- `mlc_l0~l6_hit_ratio`
+- `mlc_l0~l6_probation_insert`（0=HCC, 1=SR-HCC 风格）
+- `mlc_metrics`（MLC 各层 lookups/hits/hit_ratio 与 mode 的完整键值串）

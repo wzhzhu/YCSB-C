@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <unordered_map>
 #include <utility>
@@ -506,6 +507,36 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
         alloc_opts);
     multi_level_allocator_->Start();
   }
+
+  if (multi_level_cache_ != nullptr &&
+      ParseBool(props, "rocksdb.multi_level_cache_dynamic_srhcc_enable", false)) {
+    const int check_interval_ops = std::max(
+        64, ParseInt(props, "rocksdb.multi_level_cache_dynamic_srhcc_check_interval_ops",
+                     4096));
+    const int min_samples = std::max(
+        8, ParseInt(props, "rocksdb.multi_level_cache_dynamic_srhcc_min_samples", 64));
+    const int sample_rate_log2 = std::max(
+        0, ParseInt(props, "rocksdb.multi_level_cache_dynamic_srhcc_sample_rate_log2",
+                    7));
+    const int poll_interval_ms = std::max(
+        10, ParseInt(props, "rocksdb.multi_level_cache_dynamic_srhcc_poll_interval_ms",
+                     200));
+    const double unique_ratio_enable_threshold = ParseDouble(
+        props,
+        "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_enable_threshold",
+        ParseDouble(props,
+                    "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_threshold",
+                    0.50));
+    const double unique_ratio_disable_threshold = ParseDouble(
+        props,
+        "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_disable_threshold",
+        0.30);
+    multi_level_cache_->ConfigureDynamicSRHCC(
+        true, static_cast<uint32_t>(check_interval_ops),
+        static_cast<uint32_t>(min_samples), unique_ratio_enable_threshold,
+        unique_ratio_disable_threshold, static_cast<uint32_t>(sample_rate_log2),
+        static_cast<uint32_t>(poll_interval_ms));
+  }
 }
 
 RocksdbDB::~RocksdbDB() {
@@ -546,6 +577,39 @@ RocksdbDB::~RocksdbDB() {
                 << std::endl;
       std::cerr << "rocksdb\tmlc_level_" << i << "_hit_ratio\t"
                 << level_hit_ratio << std::endl;
+    }
+    std::string stats_text = multi_level_cache_->PrintStats();
+    size_t cursor = 0;
+    while (cursor < stats_text.size()) {
+      size_t line_end = stats_text.find('\n', cursor);
+      if (line_end == std::string::npos) {
+        line_end = stats_text.size();
+      }
+      const std::string line = stats_text.substr(cursor, line_end - cursor);
+      if (!line.empty() && line[0] == 'L') {
+        const size_t level_sep = line.find(':');
+        const size_t mode_pos = line.find("probation_insert=");
+        if (level_sep != std::string::npos && mode_pos != std::string::npos &&
+            level_sep > 1) {
+          size_t level = 0;
+          try {
+            level = static_cast<size_t>(
+                std::stoul(line.substr(1, level_sep - 1)));
+            const std::string mode_token = line.substr(
+                mode_pos + std::strlen("probation_insert="));
+            const size_t comma = mode_token.find(',');
+            const std::string mode_value =
+                comma == std::string::npos ? mode_token
+                                           : mode_token.substr(0, comma);
+            const int probation = std::stoi(mode_value);
+            std::cerr << "rocksdb\tmlc_level_" << level
+                      << "_probation_insert\t" << probation << std::endl;
+          } catch (...) {
+            // Ignore parse errors and keep benchmark running.
+          }
+        }
+      }
+      cursor = line_end + 1;
     }
     const double total_level_hit_ratio =
         total_lookups > 0

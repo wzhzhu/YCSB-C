@@ -2,6 +2,7 @@
 import argparse
 import csv
 import datetime as dt
+import os
 import pathlib
 import re
 import shutil
@@ -53,6 +54,20 @@ SCHEMES = {
         "rocksdb.multi_level_cache_srhcc_start_level": "-1",
         "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
     },
+    "mlc_hcc_dynamic_srhcc": {
+        "rocksdb.cache_type": "hyper_clock_cache",
+        "rocksdb.use_multi_level_cache": "true",
+        "rocksdb.num_levels": "7",
+        "rocksdb.multi_level_cache_srhcc_start_level": "-1",
+        "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
+        "rocksdb.multi_level_cache_dynamic_srhcc_enable": "true",
+        "rocksdb.multi_level_cache_dynamic_srhcc_check_interval_ops": "4096",
+        "rocksdb.multi_level_cache_dynamic_srhcc_min_samples": "12288",
+        "rocksdb.multi_level_cache_dynamic_srhcc_sample_rate_log2": "0",
+        "rocksdb.multi_level_cache_dynamic_srhcc_poll_interval_ms": "100",
+        "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_enable_threshold": "0.50",
+        "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_disable_threshold": "0.30",
+    },
 }
 
 COMMON_PROPS = {
@@ -96,7 +111,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workloads", default="A,B,C,D,E,F")
     p.add_argument(
         "--schemes",
-        default="lru,hcc,arc,cacheus,mlc_hcc_sr_bottom,mlc_hcc_all_levels",
+        default="lru,hcc,arc,cacheus,mlc_hcc_sr_bottom,mlc_hcc_all_levels,mlc_hcc_dynamic_srhcc",
     )
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--results-dir", default="results/rocksdb-matrix")
@@ -168,10 +183,41 @@ def collect_mlc_metrics(metrics: Dict[str, float]) -> str:
     return ";".join(parts)
 
 
+def get_mlc_level_metric(metrics: Dict[str, float], level: int, suffix: str) -> float:
+    return metrics.get(f"mlc_level_{level}_{suffix}", 0.0)
+
+
 def to_latency_ms(throughput_kops: float) -> float:
     if throughput_kops <= 0:
         return 0.0
     return 1.0 / throughput_kops
+
+
+def ensure_ycsbc_binary(ycsb_root: pathlib.Path) -> Tuple[bool, str]:
+    ycsbc_bin = ycsb_root / "ycsbc"
+    if ycsbc_bin.exists():
+        return True, ""
+
+    rocksdb_home = os.environ.get("ROCKSDB_HOME", "/users/wzhzhu/rocksdb")
+    link_flags = (
+        f"-Wl,-rpath,{rocksdb_home}/build-tests "
+        f"{rocksdb_home}/build-tests/librocksdb.so -lpthread -ltbb"
+    )
+    build = subprocess.run(
+        ["make", f"ROCKSDB_HOME={rocksdb_home}", f"LDFLAGS={link_flags}"],
+        cwd=str(ycsb_root),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if ycsbc_bin.exists():
+        return True, ""
+
+    detail = (
+        f"rebuild exit={build.returncode}\n"
+        f"{build.stdout or ''}\n{build.stderr or ''}"
+    )
+    return False, detail
 
 
 def run_once(
@@ -224,14 +270,33 @@ def run_once(
         "-P",
         str(spec_path),
     ]
-    proc = subprocess.run(
-        cmd,
-        cwd=str(ycsb_root),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    output = (proc.stdout or "") + (proc.stderr or "")
+    output = ""
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ycsb_root),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        output = (proc.stdout or "") + (proc.stderr or "")
+    except FileNotFoundError:
+        ok, rebuild_detail = ensure_ycsbc_binary(ycsb_root)
+        if ok:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(ycsb_root),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            output = (proc.stdout or "") + (proc.stderr or "")
+        else:
+            output = (
+                "[ERR] ycsbc binary not found and auto-rebuild failed.\n"
+                f"{rebuild_detail}\n"
+            )
+            proc = subprocess.CompletedProcess(args=cmd, returncode=127)
     log_path = log_dir / (
         f"wl{workload}-{scheme}-c{cache_bytes}-t{threads}-r{repeat_idx}.log"
     )
@@ -261,6 +326,20 @@ def run_once(
         "cache_miss": f"{metrics.get('cache_miss', 0.0):.0f}",
         "cache_hit_ratio": f"{metrics.get('cache_hit_ratio', 0.0):.6f}",
         "mlc_total_hit_ratio": f"{metrics.get('mlc_total_hit_ratio', 0.0):.6f}",
+        "mlc_l0_hit_ratio": f"{get_mlc_level_metric(metrics, 0, 'hit_ratio'):.6f}",
+        "mlc_l1_hit_ratio": f"{get_mlc_level_metric(metrics, 1, 'hit_ratio'):.6f}",
+        "mlc_l2_hit_ratio": f"{get_mlc_level_metric(metrics, 2, 'hit_ratio'):.6f}",
+        "mlc_l3_hit_ratio": f"{get_mlc_level_metric(metrics, 3, 'hit_ratio'):.6f}",
+        "mlc_l4_hit_ratio": f"{get_mlc_level_metric(metrics, 4, 'hit_ratio'):.6f}",
+        "mlc_l5_hit_ratio": f"{get_mlc_level_metric(metrics, 5, 'hit_ratio'):.6f}",
+        "mlc_l6_hit_ratio": f"{get_mlc_level_metric(metrics, 6, 'hit_ratio'):.6f}",
+        "mlc_l0_probation_insert": f"{get_mlc_level_metric(metrics, 0, 'probation_insert'):.0f}",
+        "mlc_l1_probation_insert": f"{get_mlc_level_metric(metrics, 1, 'probation_insert'):.0f}",
+        "mlc_l2_probation_insert": f"{get_mlc_level_metric(metrics, 2, 'probation_insert'):.0f}",
+        "mlc_l3_probation_insert": f"{get_mlc_level_metric(metrics, 3, 'probation_insert'):.0f}",
+        "mlc_l4_probation_insert": f"{get_mlc_level_metric(metrics, 4, 'probation_insert'):.0f}",
+        "mlc_l5_probation_insert": f"{get_mlc_level_metric(metrics, 5, 'probation_insert'):.0f}",
+        "mlc_l6_probation_insert": f"{get_mlc_level_metric(metrics, 6, 'probation_insert'):.0f}",
         "mlc_metrics": mlc_metrics,
         "executed_ops": f"{metrics.get('executed_ops', 0.0):.0f}",
         "read_ops": f"{metrics.get('read_ops', 0.0):.0f}",
@@ -312,8 +391,11 @@ def emit_markdown(rows: List[Dict[str, str]], out_path: pathlib.Path) -> None:
 def main() -> int:
     args = parse_args()
     ycsb_root = pathlib.Path(args.ycsb_root).resolve()
-    if not (ycsb_root / "ycsbc").exists():
+    ok, rebuild_detail = ensure_ycsbc_binary(ycsb_root)
+    if not ok:
         print(f"[ERR] ycsbc binary not found under: {ycsb_root}", file=sys.stderr)
+        if rebuild_detail:
+            print(rebuild_detail, file=sys.stderr)
         print("Please build first: make ROCKSDB_HOME=/users/wzhzhu/rocksdb", file=sys.stderr)
         return 2
 
