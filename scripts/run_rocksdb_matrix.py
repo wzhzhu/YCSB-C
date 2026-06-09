@@ -89,6 +89,9 @@ COMMON_PROPS = {
     # Approximate 24-byte key with "user" + zero-padded numeric suffix.
     "zeropadding": "20",
     "field_len_dist": "constant",
+    # Keep load order stable to avoid random-insert compaction corruption
+    # on the current RocksDB branch under high-volume YCSB runs.
+    "insertorder": "ordered",
     "rocksdb.raw_kv_mode": "true",
     "rocksdb.raw_key_size_bytes": "24",
     "rocksdb.raw_value_size_bytes": "1000",
@@ -139,6 +142,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=128,
         help="Fill/load phase thread count. Default is 128.",
+    )
+    p.add_argument(
+        "--insert-order",
+        choices=["ordered", "hashed"],
+        default="ordered",
+        help="YCSB key insert order for load/transaction key mapping.",
     )
     p.add_argument(
         "--refill-policy",
@@ -313,8 +322,10 @@ def run_once(
 
     metrics = parse_metrics(output)
     throughput = metrics.get("throughput_kops", 0.0)
-    read_tp = metrics.get("read_throughput_kops", 0.0)
-    write_tp = metrics.get("write_throughput_kops", 0.0)
+    read_attempt_kops = metrics.get("read_attempt_kops", 0.0)
+    write_attempt_kops = metrics.get("write_attempt_kops", 0.0)
+    read_success_kops = metrics.get("read_success_kops", 0.0)
+    write_success_kops = metrics.get("write_success_kops", 0.0)
     mlc_metrics = collect_mlc_metrics(metrics)
     arc_wrapper_hit_ratio = metrics.get("arc_wrapper_hit_ratio", 0.0)
     cacheus_wrapper_hit_ratio = metrics.get("cacheus_wrapper_hit_ratio", 0.0)
@@ -332,12 +343,13 @@ def run_once(
         "threads": str(threads),
         "repeat": str(repeat_idx),
         "exit_code": str(proc.returncode),
-        "throughput_kops": f"{throughput:.6f}",
         "avg_latency_ms": f"{to_latency_ms(throughput):.6f}",
-        "read_throughput_kops": f"{read_tp:.6f}",
-        "write_throughput_kops": f"{write_tp:.6f}",
-        "read_avg_latency_ms": f"{to_latency_ms(read_tp):.6f}",
-        "write_avg_latency_ms": f"{to_latency_ms(write_tp):.6f}",
+        "read_attempt_kops": f"{read_attempt_kops:.6f}",
+        "write_attempt_kops": f"{write_attempt_kops:.6f}",
+        "read_success_kops": f"{read_success_kops:.6f}",
+        "write_success_kops": f"{write_success_kops:.6f}",
+        "read_avg_latency_ms": f"{to_latency_ms(read_success_kops):.6f}",
+        "write_avg_latency_ms": f"{to_latency_ms(write_success_kops):.6f}",
         "cache_hit": f"{metrics.get('cache_hit', 0.0):.0f}",
         "cache_miss": f"{metrics.get('cache_miss', 0.0):.0f}",
         "cache_hit_ratio": f"{effective_hit_ratio:.6f}",
@@ -363,6 +375,8 @@ def run_once(
         "executed_ops": f"{metrics.get('executed_ops', 0.0):.0f}",
         "read_ops": f"{metrics.get('read_ops', 0.0):.0f}",
         "write_ops": f"{metrics.get('write_ops', 0.0):.0f}",
+        "read_ok_ops": f"{metrics.get('read_ok_ops', 0.0):.0f}",
+        "write_ok_ops": f"{metrics.get('write_ok_ops', 0.0):.0f}",
         "loaded_records": f"{metrics.get('loaded_records', 0.0):.0f}",
         "db_dir": str(db_dir),
         "spec_file": str(spec_path),
@@ -392,17 +406,19 @@ def emit_markdown(rows: List[Dict[str, str]], out_path: pathlib.Path) -> None:
         out_path.write_text("# No results\n", encoding="utf-8")
         return
     header = (
-        "| workload | scheme | cache(GB) | threads | throughput(Kops/s) | "
-        "read(Kops/s) | write(Kops/s) | hit_ratio |\n"
-        "|---|---|---:|---:|---:|---:|---:|---:|\n"
+        "| workload | scheme | cache(GB) | threads | read_attempt(Kops/s) | "
+        "read_success(Kops/s) | write_attempt(Kops/s) | write_success(Kops/s) | "
+        "hit_ratio |\n"
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|\n"
     )
     lines = [header]
     for r in rows:
         cache_gb = int(r["cache_bytes"]) / (1024**3)
         lines.append(
             f"| {r['workload']} | {r['scheme']} | {cache_gb:.0f} | {r['threads']} | "
-            f"{r['throughput_kops']} | {r['read_throughput_kops']} | "
-            f"{r['write_throughput_kops']} | {r['cache_hit_ratio']} |\n"
+            f"{r['read_attempt_kops']} | {r['read_success_kops']} | "
+            f"{r['write_attempt_kops']} | {r['write_success_kops']} | "
+            f"{r['cache_hit_ratio']} |\n"
         )
     out_path.write_text("".join(lines), encoding="utf-8")
 
@@ -443,6 +459,7 @@ def main() -> int:
     if args.fieldlength is not None:
         overrides["fieldlength"] = str(args.fieldlength)
     overrides["loadthreadcount"] = str(args.load_threads)
+    overrides["insertorder"] = args.insert_order
 
     results_dir = (ycsb_root / args.results_dir / run_id).resolve()
     results_dir.mkdir(parents=True, exist_ok=True)

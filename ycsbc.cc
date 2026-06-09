@@ -28,6 +28,8 @@ struct ThreadRunStats {
   uint64_t ok_ops = 0;
   uint64_t read_ops = 0;
   uint64_t write_ops = 0;
+  uint64_t read_ok_ops = 0;
+  uint64_t write_ok_ops = 0;
 };
 
 int OpsForThread(int total_ops, int thread_id, int thread_count) {
@@ -55,8 +57,14 @@ ThreadRunStats DelegateClient(ycsbc::DB *db, ycsbc::CoreWorkload *wl,
     stats.ok_ops += ok;
     if (op == ycsbc::READ || op == ycsbc::SCAN) {
       ++stats.read_ops;
+      if (ok) {
+        ++stats.read_ok_ops;
+      }
     } else {
       ++stats.write_ops;
+      if (ok) {
+        ++stats.write_ok_ops;
+      }
     }
   }
   db->Close();
@@ -114,6 +122,8 @@ int main(const int argc, const char *argv[]) {
   uint64_t executed_ops = 0;
   uint64_t read_ops = 0;
   uint64_t write_ops = 0;
+  uint64_t read_ok_ops = 0;
+  uint64_t write_ok_ops = 0;
   for (int i = 0; i < num_threads; ++i) {
     const int ops_for_thread = OpsForThread(total_ops, i, num_threads);
     actual_ops.emplace_back(async(launch::async,
@@ -127,11 +137,17 @@ int main(const int argc, const char *argv[]) {
     executed_ops += stats.ok_ops;
     read_ops += stats.read_ops;
     write_ops += stats.write_ops;
+    read_ok_ops += stats.read_ok_ops;
+    write_ok_ops += stats.write_ok_ops;
   }
   double duration = timer.End();
   const double throughput_kops = duration > 0 ? executed_ops / duration / 1000.0 : 0;
-  const double read_throughput_kops = duration > 0 ? read_ops / duration / 1000.0 : 0;
-  const double write_throughput_kops = duration > 0 ? write_ops / duration / 1000.0 : 0;
+  const double read_attempt_kops = duration > 0 ? read_ops / duration / 1000.0 : 0;
+  const double write_attempt_kops = duration > 0 ? write_ops / duration / 1000.0 : 0;
+  const double read_success_kops =
+      duration > 0 ? read_ok_ops / duration / 1000.0 : 0;
+  const double write_success_kops =
+      duration > 0 ? write_ok_ops / duration / 1000.0 : 0;
   cerr << "# Transaction throughput (KTPS)" << endl;
   cerr << props["dbname"] << '\t' << file_name << '\t' << num_threads << '\t';
   cerr << throughput_kops << endl;
@@ -139,8 +155,12 @@ int main(const int argc, const char *argv[]) {
   cerr << "rocksdb\texecuted_ops\t" << executed_ops << endl;
   cerr << "rocksdb\tread_ops\t" << read_ops << endl;
   cerr << "rocksdb\twrite_ops\t" << write_ops << endl;
-  cerr << "rocksdb\tread_throughput_kops\t" << read_throughput_kops << endl;
-  cerr << "rocksdb\twrite_throughput_kops\t" << write_throughput_kops << endl;
+  cerr << "rocksdb\tread_ok_ops\t" << read_ok_ops << endl;
+  cerr << "rocksdb\twrite_ok_ops\t" << write_ok_ops << endl;
+  cerr << "rocksdb\tread_attempt_kops\t" << read_attempt_kops << endl;
+  cerr << "rocksdb\twrite_attempt_kops\t" << write_attempt_kops << endl;
+  cerr << "rocksdb\tread_success_kops\t" << read_success_kops << endl;
+  cerr << "rocksdb\twrite_success_kops\t" << write_success_kops << endl;
   delete db;
 }
 

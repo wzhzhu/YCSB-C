@@ -616,6 +616,22 @@ RocksdbDB::~RocksdbDB() {
     std::cerr << "rocksdb\tcache_miss\t" << misses << std::endl;
     std::cerr << "rocksdb\tcache_hit_ratio\t" << hit_ratio << std::endl;
   }
+  std::cerr << "rocksdb\tinsert_get_ok\t" << insert_get_ok_count_ << std::endl;
+  std::cerr << "rocksdb\tinsert_get_not_found\t" << insert_get_not_found_count_
+            << std::endl;
+  std::cerr << "rocksdb\tinsert_get_other\t" << insert_get_other_count_
+            << std::endl;
+  std::cerr << "rocksdb\tinsert_put_ok\t" << insert_put_ok_count_ << std::endl;
+  std::cerr << "rocksdb\tinsert_put_fail\t" << insert_put_fail_count_
+            << std::endl;
+  if (!last_insert_get_other_status_.empty()) {
+    std::cerr << "rocksdb\tinsert_get_other_last_status\t"
+              << last_insert_get_other_status_ << std::endl;
+  }
+  if (!last_insert_put_fail_status_.empty()) {
+    std::cerr << "rocksdb\tinsert_put_fail_last_status\t"
+              << last_insert_put_fail_status_ << std::endl;
+  }
   EmitNumericCacheOptionsAsMetrics(block_cache_);
   if (multi_level_cache_ != nullptr) {
     const auto snapshot = multi_level_cache_->GetLevelMetricsSnapshot();
@@ -828,9 +844,14 @@ int RocksdbDB::Insert(const std::string& table, const std::string& key,
   const rocksdb::Status get_s =
       db_->Get(rocksdb::ReadOptions(), internal_key, &existing);
   if (get_s.ok()) {
+    ++insert_get_ok_count_;
     return DB::kErrorConflict;
   }
-  if (!get_s.IsNotFound()) {
+  if (get_s.IsNotFound()) {
+    ++insert_get_not_found_count_;
+  } else {
+    ++insert_get_other_count_;
+    last_insert_get_other_status_ = get_s.ToString();
     return DB::kErrorConflict;
   }
 
@@ -838,7 +859,13 @@ int RocksdbDB::Insert(const std::string& table, const std::string& key,
   wo.sync = sync_writes_;
   const rocksdb::Status put_s = db_->Put(
       wo, internal_key, raw_kv_mode_ ? raw_value_template_ : EncodeRecord(values));
-  return put_s.ok() ? DB::kOK : DB::kErrorConflict;
+  if (put_s.ok()) {
+    ++insert_put_ok_count_;
+    return DB::kOK;
+  }
+  ++insert_put_fail_count_;
+  last_insert_put_fail_status_ = put_s.ToString();
+  return DB::kErrorConflict;
 }
 
 int RocksdbDB::Delete(const std::string& table, const std::string& key) {

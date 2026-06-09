@@ -9,6 +9,7 @@
 - 线程数：`8,16,32,64,128`
 - 对比策略：`lru,hcc,arc,cacheus,mlc_hcc_sr_bottom,mlc_hcc_all_levels,mlc_hcc_dynamic_srhcc`
 - 其他固定项：
+  - `insertorder=ordered`（默认固定为顺序 key，以规避当前分支上 hashed load 触发的 compaction 异常）
   - `rocksdb.raw_kv_mode=true`
   - `rocksdb.raw_key_size_bytes=24`
   - `rocksdb.raw_value_size_bytes=1000`
@@ -115,15 +116,28 @@
 这样 transaction 阶段仍按 `--threads` 矩阵执行，只有 load/fill 阶段固定为 128 线程。
 若不指定 `--load-threads`，默认即为 `128`。
 
+可通过 `--insert-order` 切换 key 顺序（默认 `ordered`）：
+
+```bash
+./scripts/retest_rocksdb_matrix.sh --insert-order ordered
+```
+
+若确需验证 hashed key，可显式指定：
+
+```bash
+./scripts/retest_rocksdb_matrix.sh --insert-order hashed
+```
+
 关键指标包含：
 
 - `cache_hit_ratio`（统一主列；对于 `arc/cacheus` 优先采用 wrapper 口径）
 - `backing_cache_hit_ratio`（RocksDB 全局 `BLOCK_CACHE_HIT/MISS` 口径）
 - `arc_wrapper_hit_ratio` / `cacheus_wrapper_hit_ratio`（wrapper 策略口径）
 - 上述命中率统计均在每次 run 前重置，仅反映 transaction 阶段
-- `throughput_kops`
-- `read_throughput_kops`
-- `write_throughput_kops`
+- `read_attempt_kops` / `write_attempt_kops`
+- `read_success_kops` / `write_success_kops`
+- `read_ops` / `write_ops`（尝试次数）
+- `read_ok_ops` / `write_ok_ops`（成功次数）
 - `avg_latency_ms` / `read_avg_latency_ms` / `write_avg_latency_ms`
 - `mlc_total_hit_ratio`
 - `mlc_l0~l6_hit_ratio`
