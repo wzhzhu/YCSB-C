@@ -26,7 +26,11 @@
 > `rocksdb.cache_type=hyper_clock_cache` + `rocksdb.use_multi_level_cache=true` + `rocksdb.multi_level_cache_srhcc_start_level=-1` 实现。
 >
 > 说明 1c：`mlc_hcc_dynamic_srhcc` 对应“MLC 默认全层 HCC，并按每层 scan 信号动态切换到 SR-HCC 风格（probation_insert）”。
+> 当前默认所有 MLC 方案均开启 allocator 自动调节：
 > 默认策略参数：
+> - `rocksdb.multi_level_cache_auto_adjust=true`
+> - `rocksdb.multi_level_cache_allocator_mode=model`
+> - `rocksdb.multi_level_cache_adjust_interval_ms=1000`
 > - `rocksdb.multi_level_cache_dynamic_srhcc_enable=true`
 > - `rocksdb.multi_level_cache_dynamic_srhcc_check_interval_ops=4096`
 > - `rocksdb.multi_level_cache_dynamic_srhcc_min_samples=12288`
@@ -113,8 +117,10 @@
 
 关键指标包含：
 
-- `cache_hit_ratio`（来自 RocksDB 统计）
-- `cache_hit_ratio` 在每次 run 前重置统计，仅反映 transaction 阶段
+- `cache_hit_ratio`（统一主列；对于 `arc/cacheus` 优先采用 wrapper 口径）
+- `backing_cache_hit_ratio`（RocksDB 全局 `BLOCK_CACHE_HIT/MISS` 口径）
+- `arc_wrapper_hit_ratio` / `cacheus_wrapper_hit_ratio`（wrapper 策略口径）
+- 上述命中率统计均在每次 run 前重置，仅反映 transaction 阶段
 - `throughput_kops`
 - `read_throughput_kops`
 - `write_throughput_kops`

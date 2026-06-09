@@ -46,6 +46,9 @@ SCHEMES = {
         # Only the last level (L6) uses SR-HCC semantics.
         "rocksdb.multi_level_cache_srhcc_start_level": "6",
         "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
+        "rocksdb.multi_level_cache_auto_adjust": "true",
+        "rocksdb.multi_level_cache_allocator_mode": "model",
+        "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
     },
     "mlc_hcc_all_levels": {
         "rocksdb.cache_type": "hyper_clock_cache",
@@ -53,6 +56,9 @@ SCHEMES = {
         "rocksdb.num_levels": "7",
         "rocksdb.multi_level_cache_srhcc_start_level": "-1",
         "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
+        "rocksdb.multi_level_cache_auto_adjust": "true",
+        "rocksdb.multi_level_cache_allocator_mode": "model",
+        "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
     },
     "mlc_hcc_dynamic_srhcc": {
         "rocksdb.cache_type": "hyper_clock_cache",
@@ -60,6 +66,9 @@ SCHEMES = {
         "rocksdb.num_levels": "7",
         "rocksdb.multi_level_cache_srhcc_start_level": "-1",
         "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
+        "rocksdb.multi_level_cache_auto_adjust": "true",
+        "rocksdb.multi_level_cache_allocator_mode": "model",
+        "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
         "rocksdb.multi_level_cache_dynamic_srhcc_enable": "true",
         "rocksdb.multi_level_cache_dynamic_srhcc_check_interval_ops": "4096",
         "rocksdb.multi_level_cache_dynamic_srhcc_min_samples": "12288",
@@ -307,6 +316,13 @@ def run_once(
     read_tp = metrics.get("read_throughput_kops", 0.0)
     write_tp = metrics.get("write_throughput_kops", 0.0)
     mlc_metrics = collect_mlc_metrics(metrics)
+    arc_wrapper_hit_ratio = metrics.get("arc_wrapper_hit_ratio", 0.0)
+    cacheus_wrapper_hit_ratio = metrics.get("cacheus_wrapper_hit_ratio", 0.0)
+    effective_hit_ratio = metrics.get("cache_hit_ratio", 0.0)
+    if scheme == "arc" and "arc_wrapper_hit_ratio" in metrics:
+        effective_hit_ratio = arc_wrapper_hit_ratio
+    elif scheme == "cacheus" and "cacheus_wrapper_hit_ratio" in metrics:
+        effective_hit_ratio = cacheus_wrapper_hit_ratio
 
     row = {
         "run_id": run_id,
@@ -324,7 +340,10 @@ def run_once(
         "write_avg_latency_ms": f"{to_latency_ms(write_tp):.6f}",
         "cache_hit": f"{metrics.get('cache_hit', 0.0):.0f}",
         "cache_miss": f"{metrics.get('cache_miss', 0.0):.0f}",
-        "cache_hit_ratio": f"{metrics.get('cache_hit_ratio', 0.0):.6f}",
+        "cache_hit_ratio": f"{effective_hit_ratio:.6f}",
+        "backing_cache_hit_ratio": f"{metrics.get('cache_hit_ratio', 0.0):.6f}",
+        "arc_wrapper_hit_ratio": f"{arc_wrapper_hit_ratio:.6f}",
+        "cacheus_wrapper_hit_ratio": f"{cacheus_wrapper_hit_ratio:.6f}",
         "mlc_total_hit_ratio": f"{metrics.get('mlc_total_hit_ratio', 0.0):.6f}",
         "mlc_l0_hit_ratio": f"{get_mlc_level_metric(metrics, 0, 'hit_ratio'):.6f}",
         "mlc_l1_hit_ratio": f"{get_mlc_level_metric(metrics, 1, 'hit_ratio'):.6f}",

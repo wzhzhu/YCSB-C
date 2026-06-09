@@ -1,9 +1,11 @@
 #include "db/rocksdb_db.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <unordered_map>
 #include <utility>
 
@@ -63,6 +65,61 @@ double ParseDouble(const utils::Properties& props, const std::string& key,
     return std::stod(value);
   } catch (...) {
     return default_value;
+  }
+}
+
+bool TryParseDouble(const std::string& text, double* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  try {
+    size_t consumed = 0;
+    const double parsed = std::stod(text, &consumed);
+    while (consumed < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[consumed]))) {
+      ++consumed;
+    }
+    if (consumed != text.size()) {
+      return false;
+    }
+    *out = parsed;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+std::string SanitizeMetricKey(std::string key) {
+  for (char& ch : key) {
+    if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_')) {
+      ch = '_';
+    }
+  }
+  return key;
+}
+
+void EmitNumericCacheOptionsAsMetrics(const std::shared_ptr<rocksdb::Cache>& cache) {
+  if (cache == nullptr) {
+    return;
+  }
+  const std::string options = cache->GetPrintableOptions();
+  std::istringstream iss(options);
+  std::string line;
+  while (std::getline(iss, line)) {
+    if (line.empty()) {
+      continue;
+    }
+    const size_t sep = line.find('=');
+    if (sep == std::string::npos || sep == 0 || sep + 1 >= line.size()) {
+      continue;
+    }
+    const std::string key = SanitizeMetricKey(line.substr(0, sep));
+    const std::string value_str = line.substr(sep + 1);
+    double value = 0.0;
+    if (!TryParseDouble(value_str, &value)) {
+      continue;
+    }
+    std::cerr << "rocksdb\t" << key << "\t" << value << std::endl;
   }
 }
 
@@ -559,6 +616,7 @@ RocksdbDB::~RocksdbDB() {
     std::cerr << "rocksdb\tcache_miss\t" << misses << std::endl;
     std::cerr << "rocksdb\tcache_hit_ratio\t" << hit_ratio << std::endl;
   }
+  EmitNumericCacheOptionsAsMetrics(block_cache_);
   if (multi_level_cache_ != nullptr) {
     const auto snapshot = multi_level_cache_->GetLevelMetricsSnapshot();
     uint64_t total_lookups = 0;
