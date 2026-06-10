@@ -145,6 +145,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ycsb-root", default=".", help="Path to YCSB-C root.")
     p.add_argument("--threads", default="8,16,32,64,128")
     p.add_argument("--cache-gb", default="1,2,4,8")
+    p.add_argument(
+        "--shard-bits",
+        default="0",
+        help=(
+            "Comma-separated rocksdb.cache_numshardbits values (matrix "
+            "dimension). 0 = unsharded (historical default). For lru/hcc this "
+            "is native RocksDB sharding; for arc/cacheus a value k>0 shards "
+            "both the wrapper policy layer (2^k instances routed by key hash) "
+            "and the shared backing cache."
+        ),
+    )
     p.add_argument("--workloads", default="A,B,C,D,E,F")
     p.add_argument(
         "--schemes",
@@ -294,6 +305,7 @@ def run_once(
     cache_bytes: int,
     threads: int,
     repeat_idx: int,
+    shard_bits: int,
     overrides: Dict[str, str],
     db_subdir: str,
     skip_load: bool,
@@ -307,6 +319,7 @@ def run_once(
     props.update(overrides)
     props.update(SCHEMES[scheme])
     props["rocksdb.block_cache_size_bytes"] = str(cache_bytes)
+    props["rocksdb.cache_numshardbits"] = str(shard_bits)
     props["threadcount"] = str(threads)
     props["skipload"] = "true" if skip_load else "false"
     db_dir = db_root_dir / run_id / db_subdir
@@ -321,7 +334,8 @@ def run_once(
     log_dir.mkdir(parents=True, exist_ok=True)
 
     spec_path = spec_dir / (
-        f"wl{workload}-{scheme}-c{cache_bytes}-t{threads}-r{repeat_idx}.spec"
+        f"wl{workload}-{scheme}-c{cache_bytes}-t{threads}-s{shard_bits}"
+        f"-r{repeat_idx}.spec"
     )
     write_props(spec_path, props)
 
@@ -362,7 +376,8 @@ def run_once(
             )
             proc = subprocess.CompletedProcess(args=cmd, returncode=127)
     log_path = log_dir / (
-        f"wl{workload}-{scheme}-c{cache_bytes}-t{threads}-r{repeat_idx}.log"
+        f"wl{workload}-{scheme}-c{cache_bytes}-t{threads}-s{shard_bits}"
+        f"-r{repeat_idx}.log"
     )
     log_path.write_text(output, encoding="utf-8")
 
@@ -387,6 +402,7 @@ def run_once(
         "scheme": scheme,
         "cache_bytes": str(cache_bytes),
         "threads": str(threads),
+        "shard_bits": str(shard_bits),
         "repeat": str(repeat_idx),
         "exit_code": str(proc.returncode),
         "avg_latency_ms": f"{to_latency_ms(throughput):.6f}",
@@ -461,16 +477,18 @@ def emit_markdown(rows: List[Dict[str, str]], out_path: pathlib.Path) -> None:
         out_path.write_text("# No results\n", encoding="utf-8")
         return
     header = (
-        "| workload | scheme | cache(GB) | threads | read_attempt(Kops/s) | "
+        "| workload | scheme | cache(GB) | threads | shard_bits | "
+        "read_attempt(Kops/s) | "
         "read_success(Kops/s) | write_attempt(Kops/s) | write_success(Kops/s) | "
         "hit_ratio | data_hit_ratio | filter_hit_ratio | index_hit_ratio |\n"
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
     )
     lines = [header]
     for r in rows:
         cache_gb = int(r["cache_bytes"]) / (1024**3)
         lines.append(
             f"| {r['workload']} | {r['scheme']} | {cache_gb:.0f} | {r['threads']} | "
+            f"{r['shard_bits']} | "
             f"{r['read_attempt_kops']} | {r['read_success_kops']} | "
             f"{r['write_attempt_kops']} | {r['write_success_kops']} | "
             f"{r['cache_hit_ratio']} | {r['cache_data_hit_ratio']} | "
@@ -492,6 +510,7 @@ def main() -> int:
 
     threads = [int(x) for x in args.threads.split(",") if x]
     cache_gb = [int(x) for x in args.cache_gb.split(",") if x]
+    shard_bits_list = [int(x) for x in args.shard_bits.split(",") if x.strip()]
     workloads = [x.strip().upper() for x in args.workloads.split(",") if x.strip()]
     schemes = [x.strip() for x in args.schemes.split(",") if x.strip()]
 
@@ -522,21 +541,22 @@ def main() -> int:
     db_root_dir = pathlib.Path(args.db_root_dir).resolve()
     db_root_dir.mkdir(parents=True, exist_ok=True)
 
-    matrix: List[Tuple[str, str, int, int, int]] = []
+    matrix: List[Tuple[str, str, int, int, int, int]] = []
     for wl in workloads:
         for scheme in schemes:
             for cgb in cache_gb:
                 for t in threads:
-                    for r in range(1, args.repeats + 1):
-                        matrix.append((wl, scheme, cgb * 1024**3, t, r))
+                    for sb in shard_bits_list:
+                        for r in range(1, args.repeats + 1):
+                            matrix.append((wl, scheme, cgb * 1024**3, t, sb, r))
 
     print(f"[INFO] run_id={run_id}")
     print(f"[INFO] total_runs={len(matrix)}")
     if args.dry_run:
-        for wl, scheme, cache_bytes, t, r in matrix[:20]:
+        for wl, scheme, cache_bytes, t, sb, r in matrix[:20]:
             print(
                 f"dry-run: wl={wl} scheme={scheme} cache={cache_bytes}B "
-                f"threads={t} repeat={r}"
+                f"threads={t} shard_bits={sb} repeat={r}"
             )
         if len(matrix) > 20:
             print(f"... ({len(matrix) - 20} more)")
@@ -552,10 +572,10 @@ def main() -> int:
     shared_db_subdirs: Dict[str, str] = {}
 
     rows: List[Dict[str, str]] = []
-    for idx, (wl, scheme, cache_bytes, t, r) in enumerate(matrix, start=1):
+    for idx, (wl, scheme, cache_bytes, t, sb, r) in enumerate(matrix, start=1):
         print(
             f"[{idx}/{len(matrix)}] wl={wl} scheme={scheme} "
-            f"cache={cache_bytes} threads={t} repeat={r}",
+            f"cache={cache_bytes} threads={t} shard_bits={sb} repeat={r}",
             flush=True,
         )
         reuse_db = (
@@ -568,7 +588,7 @@ def main() -> int:
             clean_db_before_run = wl not in shared_loaded_workloads
             cleanup_after_run = False
         else:
-            db_subdir = f"wl{wl}-{scheme}-c{cache_bytes}-t{t}-r{r}"
+            db_subdir = f"wl{wl}-{scheme}-c{cache_bytes}-t{t}-s{sb}-r{r}"
             skip_load = False
             clean_db_before_run = True
             cleanup_after_run = True
@@ -583,6 +603,7 @@ def main() -> int:
             cache_bytes,
             t,
             r,
+            sb,
             overrides,
             db_subdir,
             skip_load,

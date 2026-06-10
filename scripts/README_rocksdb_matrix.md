@@ -18,7 +18,7 @@
   - `rocksdb.bloom_bits_per_key=10`
   - `rocksdb.cache_index_and_filter_blocks=true`
   - `rocksdb.cache_index_and_filter_blocks_with_high_priority=true`
-  - `rocksdb.cache_numshardbits=0`（所有方案不分片）
+  - `rocksdb.cache_numshardbits=0`（默认所有方案不分片；可用 `--shard-bits` 扫描）
   - `rocksdb.use_direct_reads=true` / `rocksdb.use_direct_io_for_flush_and_compaction=true`
     （O_DIRECT 绕过 page cache：250GB 内存远大于 100GB 数据时，buffered 读会让
     miss 几乎免费，吞吐与 hit ratio 脱钩，且复用 DB 的 case 之间互相焐热缓存）
@@ -129,6 +129,23 @@
 
 这样 transaction 阶段仍按 `--threads` 矩阵执行，只有 load/fill 阶段固定为 128 线程。
 若不指定 `--load-threads`，默认即为 `128`。
+
+可通过 `--shard-bits` 扫描缓存分片数（矩阵新维度，默认 `0` 即不分片）：
+
+```bash
+python3 scripts/run_rocksdb_matrix.py --shard-bits 0,6 --schemes lru,hcc,arc,cacheus
+```
+
+语义说明（`rocksdb.cache_numshardbits = k`，分片数 = 2^k）：
+
+- `lru` / `hcc`：RocksDB 原生 `ShardedCache` 分片；
+- `arc` / `cacheus`（`k > 0`）：wrapper 策略层同时分片——构建 2^k 个独立的
+  ARC/Cacheus 实例（各自独立锁与元数据，按 key hash 路由），共享同一个原生
+  分片的 backing HCC；`ShardedWrapperCache` 路由层负责分发与统计聚合，
+  `arc_wrapper_hit_ratio` / `cacheus_wrapper_hit_ratio` 为跨 shard 聚合值；
+- `arc` / `cacheus`（`k <= 0`）：保持单实例 wrapper（历史行为）。
+
+`summary.csv` / `summary.md` 含 `shard_bits` 列；case 命名带 `-s{bits}` 后缀。
 
 可通过 `--insert-order` 切换 key 顺序（默认 `ordered`）：
 
