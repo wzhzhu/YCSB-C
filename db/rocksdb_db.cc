@@ -420,6 +420,8 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
   options.compression = ParseCompressionType(
       props.GetProperty("rocksdb.compression", "none"));
   options.use_direct_reads = ParseBool(props, "rocksdb.use_direct_reads", false);
+  options.use_direct_io_for_flush_and_compaction = ParseBool(
+      props, "rocksdb.use_direct_io_for_flush_and_compaction", false);
   options.allow_mmap_reads = ParseBool(props, "rocksdb.allow_mmap_reads", false);
   options.statistics = rocksdb::CreateDBStatistics();
   statistics_ = options.statistics;

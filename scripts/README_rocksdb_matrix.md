@@ -4,7 +4,7 @@
 
 - 工作负载：`A,B,C,D,E,F`
 - 预填充：`100GB`（按 `1024B/KV` 近似换算为 `recordcount=104857600`）
-- 事务数：`operationcount=1000000`
+- 事务数：`operationcount=20000000`（1M 只能测到冷启动预热瞬态，20M 才能进入稳态）
 - block cache：`1GB,2GB,4GB,8GB`
 - 线程数：`8,16,32,64,128`
 - 对比策略：`lru,hcc,arc,cacheus,mlc_hcc_sr_bottom,mlc_hcc_all_levels,mlc_hcc_dynamic_srhcc,mlc_hcc_sr_bottom_deff,mlc_hcc_all_levels_deff,mlc_hcc_dynamic_srhcc_deff`
@@ -19,6 +19,9 @@
   - `rocksdb.cache_index_and_filter_blocks=true`
   - `rocksdb.cache_index_and_filter_blocks_with_high_priority=true`
   - `rocksdb.cache_numshardbits=0`（所有方案不分片）
+  - `rocksdb.use_direct_reads=true` / `rocksdb.use_direct_io_for_flush_and_compaction=true`
+    （O_DIRECT 绕过 page cache：250GB 内存远大于 100GB 数据时，buffered 读会让
+    miss 几乎免费，吞吐与 hit ratio 脱钩，且复用 DB 的 case 之间互相焐热缓存）
 
 > 说明 1：`mlc_hcc_sr_bottom` 对应“上层 HCC，仅最下层 SR-HCC”，通过  
 > `rocksdb.cache_type=hyper_clock_cache` + `rocksdb.use_multi_level_cache=true` + `rocksdb.multi_level_cache_srhcc_start_level=6`（7层）实现。

@@ -100,7 +100,9 @@ COMMON_PROPS = {
     "workload": "com.yahoo.ycsb.workloads.CoreWorkload",
     # 100GB with 1024B KV assumption => 104,857,600 records.
     "recordcount": str(100 * 1024 * 1024 * 1024 // 1024),
-    "operationcount": "1000000",
+    # 20M ops so the transaction phase reaches steady state (1M only measured
+    # the cold-start warm-up transient at these cache sizes).
+    "operationcount": "20000000",
     "fieldcount": "10",
     "fieldlength": "100",
     # Approximate 24-byte key with "user" + zero-padded numeric suffix.
@@ -119,6 +121,12 @@ COMMON_PROPS = {
     "rocksdb.bloom_bits_per_key": "10",
     "rocksdb.cache_index_and_filter_blocks": "true",
     "rocksdb.cache_index_and_filter_blocks_with_high_priority": "true",
+    # Bypass the OS page cache so block-cache misses pay real NVMe latency.
+    # With 250GB RAM vs 100GB data, buffered reads made misses nearly free
+    # (warm page cache), decoupling throughput from hit ratio and coupling
+    # cases that share the reused DB.
+    "rocksdb.use_direct_reads": "true",
+    "rocksdb.use_direct_io_for_flush_and_compaction": "true",
 }
 
 THROUGHPUT_RE = re.compile(
