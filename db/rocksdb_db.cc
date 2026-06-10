@@ -17,6 +17,7 @@
 #include "cache/sr_hyper_clock_cache.h"
 #include "cache/arc_cache.h"
 #include "cache/cacheus_cache.h"
+#include "cache/sharded_wrapper_cache.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/db.h"
 #include "rocksdb/filter_policy.h"
@@ -933,6 +934,23 @@ void RocksdbDB::ResetStats() {
   }
   if (multi_level_cache_ != nullptr) {
     multi_level_cache_->ResetStats();
+  }
+  // Wrapper-policy hit/lookup counters (ARC/Cacheus) live outside the RocksDB
+  // statistics object; zero them too so wrapper_hit_ratio only reflects the
+  // transaction phase. Name()-based dispatch because RTTI may be disabled.
+  if (block_cache_ != nullptr) {
+    const char* name = block_cache_->Name();
+    if (std::strcmp(name, rocksdb::ARCCache::kClassName()) == 0) {
+      static_cast<rocksdb::ARCCache*>(block_cache_.get())
+          ->ResetWrapperCounters();
+    } else if (std::strcmp(name, rocksdb::CacheusCache::kClassName()) == 0) {
+      static_cast<rocksdb::CacheusCache*>(block_cache_.get())
+          ->ResetWrapperCounters();
+    } else if (std::strcmp(name, rocksdb::ShardedWrapperCache::kClassName()) ==
+               0) {
+      static_cast<rocksdb::ShardedWrapperCache*>(block_cache_.get())
+          ->ResetWrapperCounters();
+    }
   }
 }
 
