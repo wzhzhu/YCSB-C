@@ -87,6 +87,15 @@ SCHEMES = {
     },
 }
 
+# D_eff variants: same as the base MLC schemes but the allocator models each
+# level with its effective working-set estimate D_eff = -(alpha*c)/ln(1-hit)
+# instead of the raw level data size (ported from db_bench).
+for _base in ("mlc_hcc_sr_bottom", "mlc_hcc_all_levels", "mlc_hcc_dynamic_srhcc"):
+    SCHEMES[f"{_base}_deff"] = {
+        **SCHEMES[_base],
+        "rocksdb.multi_level_cache_use_effective_data_size": "true",
+    }
+
 COMMON_PROPS = {
     "workload": "com.yahoo.ycsb.workloads.CoreWorkload",
     # 100GB with 1024B KV assumption => 104,857,600 records.
@@ -131,7 +140,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workloads", default="A,B,C,D,E,F")
     p.add_argument(
         "--schemes",
-        default="lru,hcc,arc,cacheus,mlc_hcc_sr_bottom,mlc_hcc_all_levels,mlc_hcc_dynamic_srhcc",
+        default=(
+            "lru,hcc,arc,cacheus,"
+            "mlc_hcc_sr_bottom,mlc_hcc_all_levels,mlc_hcc_dynamic_srhcc,"
+            "mlc_hcc_sr_bottom_deff,mlc_hcc_all_levels_deff,"
+            "mlc_hcc_dynamic_srhcc_deff"
+        ),
     )
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--results-dir", default="results/rocksdb-matrix")

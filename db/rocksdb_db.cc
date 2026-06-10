@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <iostream>
 #include <sstream>
 #include <unordered_map>
@@ -492,74 +495,263 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
       alloc_opts.mode = rocksdb::MultiLevelAllocatorMode::kModel;
     }
 
+    // Estimator semantics ported from db_bench (tools/db_bench_tool.cc):
+    //   constant_one    : alpha = 1, D = window-smoothed raw level data size.
+    //   robust_hit_rate : alpha derived by exactly inverting the model hit
+    //                     curve hit = 1 - exp(-alpha*c/D) at the observed
+    //                     (capacity, hit_rate) point, with confidence
+    //                     shrinkage to a prior and EMA smoothing.
+    // Additionally, use_effective_data_size replaces D with an effective
+    // working-set estimate D_eff = -(alpha*c)/ln(1-hit), confidence-blended
+    // with raw data and clamped to [0.01*D_raw, D_raw].
+    // The shadow_cache estimator from db_bench is not ported.
     const std::string alpha_estimator = props.GetProperty(
         "rocksdb.multi_level_cache_alpha_estimator", "constant_one");
     const double alpha_floor = ParseDouble(
-        props, "rocksdb.multi_level_cache_alpha_floor", 1.0);
+        props, "rocksdb.multi_level_cache_alpha_floor", 0.1);
     const double alpha_max = ParseDouble(
         props, "rocksdb.multi_level_cache_alpha_max", 100.0);
+    const bool use_effective_data_size = ParseBool(
+        props, "rocksdb.multi_level_cache_use_effective_data_size", false);
+    const size_t alpha_window_rounds = static_cast<size_t>(std::max(
+        1, ParseInt(props, "rocksdb.multi_level_cache_alpha_window_rounds", 5)));
+    const size_t data_window_rounds = static_cast<size_t>(std::max(
+        1,
+        ParseInt(props, "rocksdb.multi_level_cache_data_size_window_rounds", 5)));
+    const uint64_t data_window_us =
+        static_cast<uint64_t>(std::max(
+            1, ParseInt(props, "rocksdb.multi_level_cache_data_size_window_ms",
+                        5000))) *
+        1000;
+    const bool use_constant_one_alpha = alpha_estimator != "robust_hit_rate";
 
     multi_level_allocator_ = std::make_unique<rocksdb::MultiLevelCacheAllocator>(
         multi_level_cache_,
-        [this, alpha_estimator, alpha_floor, alpha_max](
+        [cache = multi_level_cache_, alpha_floor, alpha_max,
+         use_effective_data_size, alpha_window_rounds, data_window_rounds,
+         data_window_us, use_constant_one_alpha,
+         prev_lookups = std::vector<uint64_t>{},
+         prev_hits = std::vector<uint64_t>{},
+         prev_alpha = std::vector<double>{},
+         prev_effective_data = std::vector<double>{},
+         observed_history =
+             std::vector<std::deque<std::pair<uint64_t, uint64_t>>>{},
+         raw_data_history =
+             std::vector<std::deque<std::pair<uint64_t, double>>>{}](
             std::vector<double>* lambda, std::vector<double>* data,
-            std::vector<double>* alpha) {
-          if (multi_level_cache_ == nullptr || lambda == nullptr || data == nullptr ||
+            std::vector<double>* alpha) mutable {
+          if (cache == nullptr || lambda == nullptr || data == nullptr ||
               alpha == nullptr) {
             return false;
           }
-          const auto snapshot = multi_level_cache_->GetLevelMetricsSnapshot();
-          const size_t n = snapshot.lookups.size();
-          if (n == 0 || snapshot.hits.size() != n ||
-              snapshot.capacities.size() != n || snapshot.data_sizes.size() != n) {
+          const auto stats = cache->GetLevelMetricsSnapshot();
+          const size_t level_count = stats.lookups.size();
+          if (level_count == 0 || stats.hits.size() != level_count ||
+              stats.capacities.size() != level_count ||
+              stats.data_sizes.size() != level_count) {
+            return false;
+          }
+          if (prev_lookups.size() != level_count ||
+              prev_hits.size() != level_count ||
+              prev_alpha.size() != level_count ||
+              prev_effective_data.size() != level_count ||
+              observed_history.size() != level_count ||
+              raw_data_history.size() != level_count) {
+            prev_lookups = stats.lookups;
+            prev_hits = stats.hits;
+            prev_alpha.assign(level_count, 1.0);
+            prev_effective_data.assign(level_count, 1.0);
+            for (size_t level = 0; level < level_count; ++level) {
+              prev_effective_data[level] =
+                  stats.data_sizes[level] > 0
+                      ? static_cast<double>(stats.data_sizes[level])
+                      : 1.0;
+            }
+            observed_history.assign(
+                level_count, std::deque<std::pair<uint64_t, uint64_t>>{});
+            raw_data_history.assign(level_count,
+                                    std::deque<std::pair<uint64_t, double>>{});
             return false;
           }
 
-          if (prev_allocator_lookups_.size() != n) {
-            prev_allocator_lookups_.assign(n, 0);
-            prev_allocator_hits_.assign(n, 0);
-          }
+          lambda->assign(level_count, 1.0);
+          data->assign(level_count, 1.0);
+          alpha->assign(level_count, 1.0);
 
-          lambda->assign(n, 0.0);
-          data->assign(n, 0.0);
-          alpha->assign(n, 1.0);
-          bool has_signal = false;
-          for (size_t i = 0; i < n; ++i) {
-            const uint64_t curr_l = snapshot.lookups[i];
-            const uint64_t curr_h = snapshot.hits[i];
-            const uint64_t delta_l =
-                curr_l >= prev_allocator_lookups_[i]
-                    ? curr_l - prev_allocator_lookups_[i]
-                    : curr_l;
-            const uint64_t delta_h =
-                curr_h >= prev_allocator_hits_[i] ? curr_h - prev_allocator_hits_[i]
-                                                  : curr_h;
-            prev_allocator_lookups_[i] = curr_l;
-            prev_allocator_hits_[i] = curr_h;
-
-            (*lambda)[i] = static_cast<double>(delta_l > 0 ? delta_l : 1);
-            double di = snapshot.data_sizes[i] > 0
-                            ? static_cast<double>(snapshot.data_sizes[i])
-                            : static_cast<double>(snapshot.capacities[i]);
-            if (di <= 0) {
-              di = 1.0;
-            }
-            (*data)[i] = di;
-
-            double ai = 1.0;
-            if (alpha_estimator == "robust_hit_rate") {
-              const double hr =
-                  delta_l > 0 ? static_cast<double>(delta_h) / delta_l : 0.0;
-              const double clipped = std::max(0.01, std::min(0.99, hr));
-              ai = 1.0 / clipped;
-            }
-            ai = std::max(alpha_floor, std::min(alpha_max, ai));
-            (*alpha)[i] = ai;
-            if (delta_l > 0 || snapshot.data_sizes[i] > 0) {
-              has_signal = true;
+          uint64_t total_observed_data = 0;
+          size_t observed_levels = 0;
+          for (size_t level = 0; level < level_count; ++level) {
+            if (stats.data_sizes[level] > 0) {
+              total_observed_data += stats.data_sizes[level];
+              ++observed_levels;
             }
           }
-          return has_signal;
+          const double default_data =
+              observed_levels > 0
+                  ? static_cast<double>(total_observed_data) /
+                        static_cast<double>(observed_levels)
+                  : 1.0;
+          constexpr double kLambdaEpsilon = 1e-6;
+          constexpr double kAlphaPrior = 1.0;
+          constexpr uint64_t kAlphaConfidenceLookups = 5000;
+          constexpr double kAlphaEmaBeta = 0.2;
+          constexpr uint64_t kDataConfidenceLookups = 20000;
+          constexpr double kDataEmaBeta = 0.25;
+          constexpr double kDataDriftBetaNoObs = 0.05;
+          constexpr double kDataMinFractionOfRaw = 0.01;
+          constexpr double kMinMissRate = 1e-6;
+          constexpr double kMaxHitRate = 1.0 - kMinMissRate;
+          const uint64_t now_us = static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count());
+          const uint64_t data_window_start =
+              now_us > data_window_us ? now_us - data_window_us : 0;
+          for (size_t level = 0; level < level_count; ++level) {
+            const uint64_t curr_lookups = stats.lookups[level];
+            const uint64_t curr_hits = stats.hits[level];
+            const uint64_t delta_lookups =
+                curr_lookups >= prev_lookups[level]
+                    ? curr_lookups - prev_lookups[level]
+                    : 0;
+            const uint64_t delta_hits =
+                curr_hits >= prev_hits[level] ? curr_hits - prev_hits[level]
+                                              : 0;
+
+            (*lambda)[level] = delta_lookups > 0
+                                   ? static_cast<double>(delta_lookups)
+                                   : kLambdaEpsilon;
+            const double raw_level_data_instant =
+                stats.data_sizes[level] > 0
+                    ? static_cast<double>(stats.data_sizes[level])
+                    : default_data;
+            auto& raw_history = raw_data_history[level];
+            raw_history.push_back({now_us, raw_level_data_instant});
+            while (raw_history.size() >= 2 &&
+                   raw_history[1].first <= data_window_start) {
+              raw_history.pop_front();
+            }
+            while (raw_history.size() > data_window_rounds) {
+              raw_history.pop_front();
+            }
+            double raw_level_data = raw_level_data_instant;
+            if (!raw_history.empty() && now_us > data_window_start) {
+              uint64_t prev_ts = data_window_start;
+              double prev_val = raw_history.front().second;
+              double weighted_sum = 0.0;
+              for (const auto& sample : raw_history) {
+                const uint64_t sample_ts = std::min(now_us, sample.first);
+                if (sample_ts > prev_ts) {
+                  weighted_sum +=
+                      prev_val * static_cast<double>(sample_ts - prev_ts);
+                }
+                prev_ts = std::max(prev_ts, sample_ts);
+                prev_val = sample.second;
+              }
+              if (now_us > prev_ts) {
+                weighted_sum += prev_val * static_cast<double>(now_us - prev_ts);
+              }
+              const double denom =
+                  static_cast<double>(now_us - data_window_start);
+              if (denom > 0.0) {
+                raw_level_data = weighted_sum / denom;
+              }
+            }
+            if (use_constant_one_alpha) {
+              (*alpha)[level] = 1.0;
+              (*data)[level] = raw_level_data;
+              prev_alpha[level] = 1.0;
+              prev_effective_data[level] = raw_level_data;
+              continue;
+            }
+
+            // Robust online alpha estimation:
+            //   1) derive raw alpha from observed window hit rate
+            //   2) confidence-shrink to prior under small samples
+            //   3) EMA smooth across windows
+            double derived_alpha = prev_alpha[level];
+            const size_t capacity_bytes = stats.capacities[level];
+            double observed_hit_rate = -1.0;
+            if (delta_lookups > 0 && capacity_bytes > 0 &&
+                raw_level_data > 0.0) {
+              observed_history[level].push_back({delta_hits, delta_lookups});
+              while (observed_history[level].size() > alpha_window_rounds) {
+                observed_history[level].pop_front();
+              }
+              uint64_t observed_hits_sum = 0;
+              uint64_t observed_lookups_sum = 0;
+              for (const auto& p : observed_history[level]) {
+                observed_hits_sum += p.first;
+                observed_lookups_sum += p.second;
+              }
+              observed_hit_rate = std::min(
+                  kMaxHitRate,
+                  std::max(0.0, static_cast<double>(observed_hits_sum) /
+                                    static_cast<double>(observed_lookups_sum)));
+              const double miss_rate =
+                  std::max(kMinMissRate, 1.0 - observed_hit_rate);
+              derived_alpha =
+                  -(raw_level_data / static_cast<double>(capacity_bytes)) *
+                  std::log(miss_rate);
+            }
+
+            const double confidence =
+                std::min(1.0, static_cast<double>(delta_lookups) /
+                                  static_cast<double>(kAlphaConfidenceLookups));
+            const double shrunk_alpha =
+                confidence * derived_alpha + (1.0 - confidence) * kAlphaPrior;
+            const double smoothed_alpha =
+                (1.0 - kAlphaEmaBeta) * prev_alpha[level] +
+                kAlphaEmaBeta * shrunk_alpha;
+            double final_alpha = smoothed_alpha;
+            if (final_alpha < alpha_floor) {
+              final_alpha = alpha_floor;
+            } else if (final_alpha > alpha_max) {
+              final_alpha = alpha_max;
+            }
+            (*alpha)[level] = final_alpha;
+            prev_alpha[level] = final_alpha;
+
+            const double previous_effective_data =
+                prev_effective_data[level] > 0.0 ? prev_effective_data[level]
+                                                 : raw_level_data;
+            const bool has_observed_hit = observed_hit_rate >= 0.0;
+            double target_effective_data = raw_level_data;
+            if (has_observed_hit && capacity_bytes > 0 && final_alpha > 0.0) {
+              const double miss_rate =
+                  std::max(kMinMissRate, 1.0 - observed_hit_rate);
+              const double observed_effective_data =
+                  -(final_alpha * static_cast<double>(capacity_bytes)) /
+                  std::log(miss_rate);
+              if (std::isfinite(observed_effective_data) &&
+                  observed_effective_data > 0.0) {
+                const double data_confidence = std::min(
+                    1.0, static_cast<double>(delta_lookups) /
+                             static_cast<double>(kDataConfidenceLookups));
+                target_effective_data =
+                    data_confidence * observed_effective_data +
+                    (1.0 - data_confidence) * raw_level_data;
+              }
+            }
+            const double data_beta =
+                has_observed_hit ? kDataEmaBeta : kDataDriftBetaNoObs;
+            double effective_level_data =
+                previous_effective_data +
+                data_beta * (target_effective_data - previous_effective_data);
+            const double data_lower_bound =
+                std::max(1.0, raw_level_data * kDataMinFractionOfRaw);
+            const double data_upper_bound =
+                std::max(raw_level_data, data_lower_bound);
+            effective_level_data =
+                std::max(data_lower_bound,
+                         std::min(effective_level_data, data_upper_bound));
+            (*data)[level] =
+                use_effective_data_size ? effective_level_data : raw_level_data;
+            prev_effective_data[level] = effective_level_data;
+          }
+          prev_lookups = stats.lookups;
+          prev_hits = stats.hits;
+          return true;
         },
         alloc_opts);
     multi_level_allocator_->Start();

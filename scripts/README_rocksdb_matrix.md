@@ -7,7 +7,7 @@
 - 事务数：`operationcount=1000000`
 - block cache：`1GB,2GB,4GB,8GB`
 - 线程数：`8,16,32,64,128`
-- 对比策略：`lru,hcc,arc,cacheus,mlc_hcc_sr_bottom,mlc_hcc_all_levels,mlc_hcc_dynamic_srhcc`
+- 对比策略：`lru,hcc,arc,cacheus,mlc_hcc_sr_bottom,mlc_hcc_all_levels,mlc_hcc_dynamic_srhcc,mlc_hcc_sr_bottom_deff,mlc_hcc_all_levels_deff,mlc_hcc_dynamic_srhcc_deff`
 - 其他固定项：
   - `insertorder=ordered`（默认固定为顺序 key，以规避当前分支上 hashed load 触发的 compaction 异常）
   - `rocksdb.raw_kv_mode=true`
@@ -27,12 +27,20 @@
 > `rocksdb.cache_type=hyper_clock_cache` + `rocksdb.use_multi_level_cache=true` + `rocksdb.multi_level_cache_srhcc_start_level=-1` 实现。
 >
 > 说明 1c：`mlc_hcc_dynamic_srhcc` 对应“MLC 默认全层 HCC，并按每层 scan 信号动态切换到 SR-HCC 风格（probation_insert）”。
+>
+> 说明 1d：`mlc_hcc_*_deff` 是对应基础方案的 D_eff 变体
+> （`rocksdb.multi_level_cache_use_effective_data_size=true`）：allocator 用
+> 每层的有效工作集估计 `D_eff = -(alpha*c)/ln(1-hit)`（带置信度混合与 EMA
+> 平滑，截断在 `[0.01*D_raw, D_raw]`）替代原始层数据量 D_raw 参与模型求解。
+> 实现移植自 db_bench（`--multi_level_cache_use_effective_data_size`）。
 > 当前默认所有 MLC 方案均开启 allocator 自动调节：
 > 默认策略参数：
 > - `rocksdb.multi_level_cache_auto_adjust=true`
 > - `rocksdb.multi_level_cache_allocator_mode=model`
 > - `rocksdb.multi_level_cache_adjust_interval_ms=1000`
-> - `rocksdb.multi_level_cache_alpha_estimator=robust_hit_rate`（alpha=1/hit_rate；
+> - `rocksdb.multi_level_cache_alpha_estimator=robust_hit_rate`（与 db_bench 对齐：
+>   按观测 (capacity, hit_rate) 精确反演 `alpha = -(D/c)*ln(1-hit)`，带置信度
+>   收缩与 EMA 平滑，截断在 `[alpha_floor=0.1, alpha_max=100]`；
 >   默认的 constant_one 均匀模型会在小预算下把数据量巨大的底层容量分配为 0，
 >   例如 1-2GB 预算时承载 84% 流量的 L6 被分配 0 字节）
 > - `rocksdb.multi_level_cache_dynamic_srhcc_enable=true`

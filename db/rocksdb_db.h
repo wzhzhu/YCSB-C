@@ -59,8 +59,6 @@ class RocksdbDB : public DB {
   std::shared_ptr<rocksdb::Cache> block_cache_;
   std::shared_ptr<rocksdb::MultiLevelCache> multi_level_cache_;
   std::unique_ptr<rocksdb::MultiLevelCacheAllocator> multi_level_allocator_;
-  std::vector<uint64_t> prev_allocator_lookups_;
-  std::vector<uint64_t> prev_allocator_hits_;
   std::shared_ptr<rocksdb::Statistics> statistics_;
   bool raw_kv_mode_ = false;
   size_t raw_key_size_bytes_ = 24;
