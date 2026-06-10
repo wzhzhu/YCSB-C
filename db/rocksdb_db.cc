@@ -651,6 +651,18 @@ RocksdbDB::~RocksdbDB() {
                 << std::endl;
       std::cerr << "rocksdb\tmlc_level_" << i << "_hit_ratio\t"
                 << level_hit_ratio << std::endl;
+      if (i < snapshot.capacities.size()) {
+        std::cerr << "rocksdb\tmlc_level_" << i << "_capacity\t"
+                  << snapshot.capacities[i] << std::endl;
+      }
+      if (i < snapshot.usages.size()) {
+        std::cerr << "rocksdb\tmlc_level_" << i << "_usage\t"
+                  << snapshot.usages[i] << std::endl;
+      }
+      if (i < snapshot.data_sizes.size()) {
+        std::cerr << "rocksdb\tmlc_level_" << i << "_data_size\t"
+                  << snapshot.data_sizes[i] << std::endl;
+      }
     }
     std::string stats_text = multi_level_cache_->PrintStats();
     size_t cursor = 0;
