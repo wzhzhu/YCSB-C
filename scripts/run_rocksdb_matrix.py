@@ -2,12 +2,14 @@
 import argparse
 import csv
 import datetime as dt
+import errno
 import os
 import pathlib
 import re
 import shutil
 import subprocess
 import sys
+import time
 from typing import Dict, List, Tuple
 
 
@@ -49,6 +51,10 @@ SCHEMES = {
         "rocksdb.multi_level_cache_auto_adjust": "true",
         "rocksdb.multi_level_cache_allocator_mode": "model",
         "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
+        # robust_hit_rate (alpha = 1/hit_rate) instead of the default
+        # constant_one: the uniform within-level model starves huge bottom
+        # levels (L6 got 0 bytes at 1-2GB budgets despite 84% of traffic).
+        "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
     },
     "mlc_hcc_all_levels": {
         "rocksdb.cache_type": "hyper_clock_cache",
@@ -59,6 +65,7 @@ SCHEMES = {
         "rocksdb.multi_level_cache_auto_adjust": "true",
         "rocksdb.multi_level_cache_allocator_mode": "model",
         "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
+        "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
     },
     "mlc_hcc_dynamic_srhcc": {
         "rocksdb.cache_type": "hyper_clock_cache",
@@ -69,6 +76,7 @@ SCHEMES = {
         "rocksdb.multi_level_cache_auto_adjust": "true",
         "rocksdb.multi_level_cache_allocator_mode": "model",
         "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
+        "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
         "rocksdb.multi_level_cache_dynamic_srhcc_enable": "true",
         "rocksdb.multi_level_cache_dynamic_srhcc_check_interval_ops": "4096",
         "rocksdb.multi_level_cache_dynamic_srhcc_min_samples": "12288",
@@ -180,6 +188,22 @@ def write_props(path: pathlib.Path, props: Dict[str, str]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def remove_tree_with_retry(path: pathlib.Path, retries: int = 5, delay_s: float = 0.2) -> None:
+    """Best-effort recursive delete with retry for transient ENOTEMPTY races."""
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno not in (errno.ENOTEMPTY, errno.EBUSY):
+                raise
+            if attempt + 1 >= retries:
+                raise
+            time.sleep(delay_s)
+
+
 def parse_metrics(output: str) -> Dict[str, float]:
     metrics: Dict[str, float] = {}
     m = THROUGHPUT_RE.search(output)
@@ -267,7 +291,7 @@ def run_once(
     props["rocksdb.dir"] = str(db_dir)
     db_dir.parent.mkdir(parents=True, exist_ok=True)
     if clean_db_before_run and db_dir.exists():
-        shutil.rmtree(db_dir)
+        remove_tree_with_retry(db_dir)
 
     spec_dir = results_dir / "specs"
     log_dir = results_dir / "logs"
@@ -383,7 +407,7 @@ def run_once(
         "log_file": str(log_path),
     }
     if cleanup_after_run and (not keep_db) and db_dir.exists():
-        shutil.rmtree(db_dir)
+        remove_tree_with_retry(db_dir)
     return row
 
 
@@ -554,7 +578,7 @@ def main() -> int:
         for subdir in shared_db_subdirs.values():
             shared_dir = db_root_dir / run_id / subdir
             if shared_dir.exists():
-                shutil.rmtree(shared_dir)
+                remove_tree_with_retry(shared_dir)
 
     print(f"[INFO] summary_csv={csv_path}")
     print(f"[INFO] summary_md={md_path}")

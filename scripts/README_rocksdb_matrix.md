@@ -32,6 +32,9 @@
 > - `rocksdb.multi_level_cache_auto_adjust=true`
 > - `rocksdb.multi_level_cache_allocator_mode=model`
 > - `rocksdb.multi_level_cache_adjust_interval_ms=1000`
+> - `rocksdb.multi_level_cache_alpha_estimator=robust_hit_rate`（alpha=1/hit_rate；
+>   默认的 constant_one 均匀模型会在小预算下把数据量巨大的底层容量分配为 0，
+>   例如 1-2GB 预算时承载 84% 流量的 L6 被分配 0 字节）
 > - `rocksdb.multi_level_cache_dynamic_srhcc_enable=true`
 > - `rocksdb.multi_level_cache_dynamic_srhcc_check_interval_ops=4096`
 > - `rocksdb.multi_level_cache_dynamic_srhcc_min_samples=12288`
@@ -142,4 +145,5 @@
 - `mlc_total_hit_ratio`
 - `mlc_l0~l6_hit_ratio`
 - `mlc_l0~l6_probation_insert`（0=HCC, 1=SR-HCC 风格）
-- `mlc_metrics`（MLC 各层 lookups/hits/hit_ratio 与 mode 的完整键值串）
+- `mlc_metrics`（MLC 各层 lookups/hits/hit_ratio/capacity/usage/data_size
+  与 mode 的完整键值串，用于诊断 allocator 实际给每层分配的容量）
