@@ -399,6 +399,15 @@ def run_once(
         "cache_hit": f"{metrics.get('cache_hit', 0.0):.0f}",
         "cache_miss": f"{metrics.get('cache_miss', 0.0):.0f}",
         "cache_hit_ratio": f"{effective_hit_ratio:.6f}",
+        "cache_data_hit_ratio": f"{metrics.get('cache_data_hit_ratio', 0.0):.6f}",
+        "cache_filter_hit_ratio": f"{metrics.get('cache_filter_hit_ratio', 0.0):.6f}",
+        "cache_index_hit_ratio": f"{metrics.get('cache_index_hit_ratio', 0.0):.6f}",
+        "cache_data_hit": f"{metrics.get('cache_data_hit', 0.0):.0f}",
+        "cache_data_miss": f"{metrics.get('cache_data_miss', 0.0):.0f}",
+        "cache_filter_hit": f"{metrics.get('cache_filter_hit', 0.0):.0f}",
+        "cache_filter_miss": f"{metrics.get('cache_filter_miss', 0.0):.0f}",
+        "cache_index_hit": f"{metrics.get('cache_index_hit', 0.0):.0f}",
+        "cache_index_miss": f"{metrics.get('cache_index_miss', 0.0):.0f}",
         "backing_cache_hit_ratio": f"{metrics.get('cache_hit_ratio', 0.0):.6f}",
         "arc_wrapper_hit_ratio": f"{arc_wrapper_hit_ratio:.6f}",
         "cacheus_wrapper_hit_ratio": f"{cacheus_wrapper_hit_ratio:.6f}",
@@ -454,8 +463,8 @@ def emit_markdown(rows: List[Dict[str, str]], out_path: pathlib.Path) -> None:
     header = (
         "| workload | scheme | cache(GB) | threads | read_attempt(Kops/s) | "
         "read_success(Kops/s) | write_attempt(Kops/s) | write_success(Kops/s) | "
-        "hit_ratio |\n"
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|\n"
+        "hit_ratio | data_hit_ratio | filter_hit_ratio | index_hit_ratio |\n"
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
     )
     lines = [header]
     for r in rows:
@@ -464,7 +473,8 @@ def emit_markdown(rows: List[Dict[str, str]], out_path: pathlib.Path) -> None:
             f"| {r['workload']} | {r['scheme']} | {cache_gb:.0f} | {r['threads']} | "
             f"{r['read_attempt_kops']} | {r['read_success_kops']} | "
             f"{r['write_attempt_kops']} | {r['write_success_kops']} | "
-            f"{r['cache_hit_ratio']} |\n"
+            f"{r['cache_hit_ratio']} | {r['cache_data_hit_ratio']} | "
+            f"{r['cache_filter_hit_ratio']} | {r['cache_index_hit_ratio']} |\n"
         )
     out_path.write_text("".join(lines), encoding="utf-8")
 

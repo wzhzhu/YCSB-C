@@ -809,6 +809,31 @@ RocksdbDB::~RocksdbDB() {
     std::cerr << "rocksdb\tcache_hit\t" << hits << std::endl;
     std::cerr << "rocksdb\tcache_miss\t" << misses << std::endl;
     std::cerr << "rocksdb\tcache_hit_ratio\t" << hit_ratio << std::endl;
+
+    const auto emit_typed_ratio = [&](const char* name,
+                                      rocksdb::Tickers hit_ticker,
+                                      rocksdb::Tickers miss_ticker) {
+      const uint64_t type_hits = statistics_->getTickerCount(hit_ticker);
+      const uint64_t type_misses = statistics_->getTickerCount(miss_ticker);
+      const uint64_t type_total = type_hits + type_misses;
+      const double type_ratio =
+          type_total > 0
+              ? (static_cast<double>(type_hits) /
+                 static_cast<double>(type_total))
+              : 0.0;
+      std::cerr << "rocksdb\tcache_" << name << "_hit\t" << type_hits
+                << std::endl;
+      std::cerr << "rocksdb\tcache_" << name << "_miss\t" << type_misses
+                << std::endl;
+      std::cerr << "rocksdb\tcache_" << name << "_hit_ratio\t" << type_ratio
+                << std::endl;
+    };
+    emit_typed_ratio("data", rocksdb::BLOCK_CACHE_DATA_HIT,
+                     rocksdb::BLOCK_CACHE_DATA_MISS);
+    emit_typed_ratio("filter", rocksdb::BLOCK_CACHE_FILTER_HIT,
+                     rocksdb::BLOCK_CACHE_FILTER_MISS);
+    emit_typed_ratio("index", rocksdb::BLOCK_CACHE_INDEX_HIT,
+                     rocksdb::BLOCK_CACHE_INDEX_MISS);
   }
   std::cerr << "rocksdb\tinsert_get_ok\t" << insert_get_ok_count_ << std::endl;
   std::cerr << "rocksdb\tinsert_get_not_found\t" << insert_get_not_found_count_
