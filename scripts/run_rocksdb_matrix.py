@@ -23,23 +23,31 @@ WORKLOAD_SPECS = {
 }
 
 SCHEMES = {
+    # Single-instance schemes default to 64 shards (2^6): lru/hcc via native
+    # RocksDB sharding, arc/cacheus via ShardedWrapperCache (wrapper policy
+    # layer + shared backing both sharded). MLC schemes stay unsharded (each
+    # level keeps one HCC instance) via the COMMON_PROPS default of 0.
     "lru": {
         "rocksdb.cache_type": "lru_cache",
         "rocksdb.use_multi_level_cache": "false",
+        "rocksdb.cache_numshardbits": "6",
     },
     "hcc": {
         "rocksdb.cache_type": "hyper_clock_cache",
         "rocksdb.use_multi_level_cache": "false",
+        "rocksdb.cache_numshardbits": "6",
     },
     "arc": {
         "rocksdb.cache_type": "arc_cache",
         "rocksdb.cache_pending_max_age_ops": "65536",
         "rocksdb.use_multi_level_cache": "false",
+        "rocksdb.cache_numshardbits": "6",
     },
     "cacheus": {
         "rocksdb.cache_type": "cacheus_cache",
         "rocksdb.cache_pending_max_age_ops": "65536",
         "rocksdb.use_multi_level_cache": "false",
+        "rocksdb.cache_numshardbits": "6",
     },
     "mlc_hcc_sr_bottom": {
         "rocksdb.cache_type": "hyper_clock_cache",
@@ -147,13 +155,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cache-gb", default="1,2,4,8")
     p.add_argument(
         "--shard-bits",
-        default="0",
+        default=None,
         help=(
             "Comma-separated rocksdb.cache_numshardbits values (matrix "
-            "dimension). 0 = unsharded (historical default). For lru/hcc this "
-            "is native RocksDB sharding; for arc/cacheus a value k>0 shards "
-            "both the wrapper policy layer (2^k instances routed by key hash) "
-            "and the shared backing cache."
+            "dimension). Unset = per-scheme defaults (6 i.e. 64 shards for "
+            "lru/hcc/arc/cacheus, 0 i.e. unsharded for MLC schemes). For "
+            "lru/hcc this is native RocksDB sharding; for arc/cacheus a value "
+            "k>0 shards both the wrapper policy layer (2^k instances routed "
+            "by key hash) and the shared backing cache."
         ),
     )
     p.add_argument("--workloads", default="A,B,C,D,E,F")
@@ -510,7 +519,11 @@ def main() -> int:
 
     threads = [int(x) for x in args.threads.split(",") if x]
     cache_gb = [int(x) for x in args.cache_gb.split(",") if x]
-    shard_bits_list = [int(x) for x in args.shard_bits.split(",") if x.strip()]
+    if args.shard_bits is None:
+        # None = use each scheme's default shard bits (resolved per case).
+        shard_bits_list: List[object] = [None]
+    else:
+        shard_bits_list = [int(x) for x in args.shard_bits.split(",") if x.strip()]
     workloads = [x.strip().upper() for x in args.workloads.split(",") if x.strip()]
     schemes = [x.strip() for x in args.schemes.split(",") if x.strip()]
 
@@ -541,6 +554,16 @@ def main() -> int:
     db_root_dir = pathlib.Path(args.db_root_dir).resolve()
     db_root_dir.mkdir(parents=True, exist_ok=True)
 
+    def resolve_shard_bits(scheme: str, sb: object) -> int:
+        if sb is not None:
+            return int(sb)
+        return int(
+            SCHEMES[scheme].get(
+                "rocksdb.cache_numshardbits",
+                COMMON_PROPS["rocksdb.cache_numshardbits"],
+            )
+        )
+
     matrix: List[Tuple[str, str, int, int, int, int]] = []
     for wl in workloads:
         for scheme in schemes:
@@ -548,7 +571,10 @@ def main() -> int:
                 for t in threads:
                     for sb in shard_bits_list:
                         for r in range(1, args.repeats + 1):
-                            matrix.append((wl, scheme, cgb * 1024**3, t, sb, r))
+                            matrix.append(
+                                (wl, scheme, cgb * 1024**3, t,
+                                 resolve_shard_bits(scheme, sb), r)
+                            )
 
     print(f"[INFO] run_id={run_id}")
     print(f"[INFO] total_runs={len(matrix)}")

@@ -18,7 +18,9 @@
   - `rocksdb.bloom_bits_per_key=10`
   - `rocksdb.cache_index_and_filter_blocks=true`
   - `rocksdb.cache_index_and_filter_blocks_with_high_priority=true`
-  - `rocksdb.cache_numshardbits=0`（默认所有方案不分片；可用 `--shard-bits` 扫描）
+  - `rocksdb.cache_numshardbits` 默认按方案区分：`lru/hcc/arc/cacheus` 为 `6`
+    （64 分片），MLC 方案为 `0`（每层保持单个 HCC 实例）；可用 `--shard-bits`
+    显式覆盖并扫描
   - `rocksdb.use_direct_reads=true` / `rocksdb.use_direct_io_for_flush_and_compaction=true`
     （O_DIRECT 绕过 page cache：250GB 内存远大于 100GB 数据时，buffered 读会让
     miss 几乎免费，吞吐与 hit ratio 脱钩，且复用 DB 的 case 之间互相焐热缓存）
@@ -130,7 +132,9 @@
 这样 transaction 阶段仍按 `--threads` 矩阵执行，只有 load/fill 阶段固定为 128 线程。
 若不指定 `--load-threads`，默认即为 `128`。
 
-可通过 `--shard-bits` 扫描缓存分片数（矩阵新维度，默认 `0` 即不分片）：
+可通过 `--shard-bits` 扫描缓存分片数（矩阵维度）。不指定时使用各方案默认值：
+`lru/hcc/arc/cacheus` 为 `6`（64 分片），MLC 方案为 `0`（不分片）；显式指定时
+对所有方案统一生效：
 
 ```bash
 python3 scripts/run_rocksdb_matrix.py --shard-bits 0,6 --schemes lru,hcc,arc,cacheus
