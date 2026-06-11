@@ -33,6 +33,18 @@
    - `prev_lookups` 等状态存于 lambda 捕获，load→txn 清零 MLC 计数后首个 ~1s 观测窗
      的 delta 无效，`observed_history` 中的 load 残留约 5 轮后老化。影响极小，已接受。
 
+6. **MLC `robust_hit_rate`/`D_eff` 的 alpha 反演基于混合块类型命中率**
+   - 每层 `lookups_/hits_`（`multi_level_cache.cc` 219/241 行）不区分
+     data/filter/index 块，alpha 反演 `alpha = -(D/c)*ln(1-h)` 中 `D` 是该层
+     data 字节数，`h` 却混入了元数据查找——存在模型失配。
+   - 偏差对各层不均匀：一次 Get 在多个层探查 bloom filter（常驻后命中率≈1），
+     但只在命中层读 data 块，因此浅层（key 大多不在）的混合 `h` 被抬得更高，
+     alpha 被高估，allocator 倾向于过配浅层；L6 的 `h` 更接近真实 data 命中率。
+   - 可能的细化：利用 Lookup 的 `CacheItemHelper::role` 维护每层分角色计数，
+     allocator 用 data-only 命中率建模、元数据字节单独按"全驻留"预留。
+   - 处置：先观察新一轮矩阵的 `mlc_level_N_capacity/usage`，若浅层被系统性
+     过配再实施细化。
+
 ## 二、Wrapper（ARC/Cacheus）分片设计的边界点
 
 实现：`cache/sharded_wrapper_cache.*`、`cache/wrapper_cache_shard.h`，
