@@ -237,11 +237,40 @@
       层）。改动：`cache/clock_cache.{h,cc}`、`cache/multi_level_cache.cc`。
     - 冒烟（2M 小库）：L0 排空（0 lookups）时 usage 2.9MB ≤ capacity
       5.3MB，全部层 usage ≤ capacity 成立；squatting 未复现。
-      934MB 原场景需下一轮 100GB run 复核（看排空层 usage 是否贴住
-      allocator 给的小容量）。
+    - **100GB 验证通过（dataonly-calib-20260612-052307, sr_bottom/8GB）**：
+      L0 capacity 9.3KB / usage 137KB（修复前 934MB，缩小 ~7000 倍；
+      残余为 purge 间隙内被引用/新插入的块，占总预算 0.0016%）；
+      各层 usage 总和 ≈ 8.589GB 与预算精确吻合。**本条闭环。**
     - 残留边界：purge 只裁到 capacity，低于 capacity 的陈旧块留待
       allocator 进一步收缩或自然淘汰（预算已守住，无伤）；被引用中的
       条目不可逐出，purge 对其放行（freed_count=0 即退出）。
+
+16. **MLC 性能优化四件套（EXPERIMENT_PLAN 三点五，2026-06-12 实施）的
+    边界点**
+    - **handle 裸透传 + 地址区间反查 owner**：
+      (a) 依赖 HCC slot 数组地址区间在 cache 生命周期内稳定——Fixed 表
+      数组构造后不重分配（SetCapacity 不扩表，本就是 Fixed HCC 已知
+      限制）、Auto 表登记整段保留 mmap（增长在段内），均已核实；
+      若未来引入会 realloc 表的缓存实现，须改回包装或更新区间表；
+      (b) 指针低位 tag 区分 WrappedHandle 与裸 handle，要求两类指针
+      至少 2 字节对齐（堆分配 16B 对齐、slot 数组元素 ≥8B 对齐，成立）；
+      (c) standalone（堆分配）handle 与非 HCC 子缓存仍走 WrappedHandle
+      堆分配兜底（罕见路径，不在乎）。
+    - **采样总开关**：`DrainLookupSamples` 的外部消费方（db_bench）依赖
+      "调过 `SetLookupSampleRateLog2` 即开启"；若先 Configure(false) 再
+      期待采样会失望（当前无此用法）。thread_local 采样计数使采样率仅
+      统计意义成立（每线程独立相位），unique-ratio 用途无影响。
+    - **计数器条带化**：stripe 绑定为进程级 thread_local（跨 MLC 实例
+      共享 round-robin 计数），多实例场景只是分布不均、无正确性问题；
+      读侧求和非原子快照（与旧实现一致的弱一致性）。
+    - **allocator 反震荡**：收缩迟滞会让"该让出的容量"晚 3 轮到位，
+      compaction 后的容量再平衡变慢（半衰逼近）；自适应间隔退避至
+      8×interval 后，工作集突变的响应延迟最坏 ~8s（任一变更即复位）；
+      被推迟的 shrink 同步裁掉其资助的 grow 以守预算，极端情况下 grow
+      也被推迟 3 轮。参数均在 `MultiLevelAllocationOptions`（YCSB 暂未
+      暴露 prop，用默认值）。
+    - 冒烟通过（含 Debug 断言库），100GB t64 全量重跑待做——条带化与
+      零分配的收益在 t64 高吞吐端才可量化。
 
 ## 二、Wrapper（ARC/Cacheus）分片设计的边界点
 

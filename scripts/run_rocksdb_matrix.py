@@ -87,8 +87,12 @@ SCHEMES = {
         "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
         "rocksdb.multi_level_cache_dynamic_srhcc_enable": "true",
         "rocksdb.multi_level_cache_dynamic_srhcc_check_interval_ops": "4096",
-        "rocksdb.multi_level_cache_dynamic_srhcc_min_samples": "12288",
-        "rocksdb.multi_level_cache_dynamic_srhcc_sample_rate_log2": "0",
+        # 1/16 sampling (log2=4): full sampling (0) made every lookup pay
+        # std::hash + two ring atomics, costing dynamic ~5.8us/op vs sr_bottom
+        # at 8GB. Unique-ratio only needs statistical accuracy; min_samples
+        # scaled down accordingly (12288 -> 1024) so decisions are not starved.
+        "rocksdb.multi_level_cache_dynamic_srhcc_min_samples": "1024",
+        "rocksdb.multi_level_cache_dynamic_srhcc_sample_rate_log2": "4",
         "rocksdb.multi_level_cache_dynamic_srhcc_poll_interval_ms": "100",
         "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_enable_threshold": "0.50",
         "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_disable_threshold": "0.30",

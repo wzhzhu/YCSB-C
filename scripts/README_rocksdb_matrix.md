@@ -50,8 +50,10 @@
 >   例如 1-2GB 预算时承载 84% 流量的 L6 被分配 0 字节）
 > - `rocksdb.multi_level_cache_dynamic_srhcc_enable=true`
 > - `rocksdb.multi_level_cache_dynamic_srhcc_check_interval_ops=4096`
-> - `rocksdb.multi_level_cache_dynamic_srhcc_min_samples=12288`
-> - `rocksdb.multi_level_cache_dynamic_srhcc_sample_rate_log2=0`（全采样）
+> - `rocksdb.multi_level_cache_dynamic_srhcc_min_samples=1024`
+> - `rocksdb.multi_level_cache_dynamic_srhcc_sample_rate_log2=4`（1/16 采样；
+>   旧值 0=全采样使 dynamic 每 lookup 多付 hash+ring 原子写，8GB 档慢
+>   sr_bottom 5.8µs/op，2026-06-12 调整）
 > - `rocksdb.multi_level_cache_dynamic_srhcc_poll_interval_ms=100`
 > - `rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_enable_threshold=0.50`
 > - `rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_disable_threshold=0.30`

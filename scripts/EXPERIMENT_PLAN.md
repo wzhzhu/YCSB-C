@@ -21,9 +21,22 @@
 >   684/858 kops（2GB/8GB）。MLC 与 HCC 差距 -3~-7%（Debug 时代 -47%
 >   确认为 -O0 放大软件路径，KNOWN_ISSUES 一.14 闭环）。
 >
-> 注意：本节为 metadata-in-cache 口径（每 Get ~3 次 lookup）；二点五节
-> 的新口径（仅 data block 进 cache）生效后 C 会进一步下降，正式矩阵
-> 前用首轮结果复核。
+> **新口径（data-only，dataonly-calib-20260612-052307）标定**：
+>
+> - `C ≈ 39µs`、`r_eff ≈ 93µs`（HCC 2/8GB 对解；r 为 ~280-330K IOPS
+>   负载下的排队等效值）；8GB 档 `m·r` 占 L ~40%，为混合区而非纯
+>   IOPS 墙；2GB 档 HCC/MLC miss IOPS ~324-330K 接近设备上限；
+> - 元数据移出后 data hit 整体上移（2GB 档 0.583→0.628，元数据不再
+>   挤占数据空间），且 `hit_ratio` ≡ `data_hit_ratio`；
+> - 竞争格局：2GB **MLC(878)≈HCC(871) > LRU(742, -15%)**——miss 重载
+>   下 LRU 分片锁在插入/淘汰路径吃亏（其 miss IOPS 仅 276K），第一组
+>   叙事的免费预演；8GB MLC -6%（+4.2µs/op 残余：per-level 统计原子
+>   计数争用 + 路由，L6 计数器吃 89% 流量）；
+> - **dynamic SR-HCC 在 2GB 拿到全场最高 data hit（0.6317，
+>   +0.4pp over LRU/HCC）**，MLC 命中率首次出现正信号（幅度小）；
+>   但 dynamic 8GB 吞吐 856（-13%），采样/后台 worker 代价在高命中端
+>   显形；
+> - 一.15（排空层滞留）修复后内存口径已验证精确守住预算。
 
 以下为 Debug 时代旧模型，仅留作形态参考：
 
@@ -175,6 +188,65 @@ block cache 只承载 data block，矩阵纯粹对比数据块策略。
    验证吞吐是否严格随 data hit 分层；
 4. 1GB 档 s0/s6 受控 A/B（KNOWN_ISSUES 一.7 待办）可与 pilot 合并跑；
 5. pilot 通过后正式矩阵 `--repeats 2+`（±3~5% 噪声带需量化）。
+
+## 三点五、MLC 降开销/提命中优化清单（2026-06-12 代码审查定位）
+
+> **1~4 已全部实施（2026-06-12，待 100GB 全量验证）**，实现要点：
+>
+> 1. WrappedHandle：HCC 暴露各 shard slot 数组地址区间
+>    （`HandleAddressRange`/`AppendHandleAddressRanges`，Fixed 用数组、
+>    Auto 用整段保留 mmap，生命周期内稳定），MLC 构造时建有序区间表，
+>    Lookup/Insert 命中区间的 handle **裸透传零分配**，Release 二分反查
+>    owner；standalone（堆分配）与非 HCC 子缓存兜底走 WrappedHandle，
+>    用指针低位 tag 区分两类 handle。
+> 2. 采样：新增 `lookup_sampling_enabled_` 总开关（仅 dynamic 启用或
+>    db_bench 显式设置采样率时打开），关闭时 Lookup 零开销早退；全局
+>    `lookup_sample_seq_` 原子序列改为 thread_local 计数（采样率只需
+>    统计意义成立）；YCSB dynamic 默认 `sample_rate_log2` 0→4（1/16）、
+>    `min_samples` 12288→1024。
+> 3. 计数器：per-level lookups/hits 改 16 stripes × levels 的
+>    64B 对齐条带（线程 round-robin 绑 stripe），读侧求和。
+> 4. allocator 反震荡（`MultiLevelAllocationOptions` 新字段）：
+>    总死区 `max(min_total_change_bytes, 总容量×0.5%)`；per-level 死区
+>    `max(64KB, 本层×5%)`；收缩迟滞（连续 3 轮确认 + 单轮只关一半，
+>    grow 立即）+ 预算再平衡（被推迟的 shrink 同步裁掉它资助的 grow）；
+>    稳态自适应间隔（无变更轮指数退避至 8×interval，变更即复位）。
+>
+> 冒烟（2M 库/256MB/t16/O_DIRECT/metadata-in-cache 旧口径，Release）：
+> HCC 402.6 / MLC sr_bottom 379.6 / MLC dynamic 373.8 / LRU 346.5 kops；
+> **dynamic 与 sr_bottom 差距 8%→1.5%**（采样优化生效）；MLC 反超 LRU
+> ~10%；与 HCC 差 -5.7% 含 0.7pp 命中率差（小库分区统计损失，量级与
+> wlC 结构损失一致）。per-level 统计自洽、排空层 usage≈0、容量分配
+> 稳定。Debug（断言开启）库下 MLC 冒烟无断言触发，routing 单测通过。
+> 条带化/无分配收益主要在 t64 高吞吐端，待 100GB 重跑量化。
+
+8GB 档 +4.2µs/op（69.0 vs HCC 64.9µs）分解与修法，按性价比排序：
+
+1. **消灭 WrappedHandle 堆分配**（每命中 new/delete 一个 16B 对象，
+   ~1M malloc/free每秒打 glibc arena 锁；est. 1~3µs/op）：HCC 的
+   Value/GetCharge/Ref 只读 handle 不依赖实例可直接转发；仅 Release
+   需 owner——MLC 构造时登记各子缓存 handle 数组地址区间（7层+shared
+   ≈8 段），Release 按指针二分反查。零分配零新字段。
+2. **采样早退 + dynamic 降采样**：`MaybeRecordLookupSample` 的全局
+   `lookup_sample_seq_.fetch_add` 在判断前执行，sr_bottom/all_levels
+   也白付一次全局原子加；且 `sample_rate_log2=0` 语义为**全采样**
+   （YCSB dynamic 配置正是 0），dynamic 每 lookup 多付 std::hash +
+   ring 两次原子写 —— 即 dynamic 8GB 比 sr_bottom 慢 5.8µs/op
+   （856 vs 927）的来源。修：禁用时 fetch_add 前早退；启用时默认
+   log2=4~6（1/16~1/64，unique ratio 统计上足够）。
+3. **per-level lookups_/hits_ 计数器条带化**（L6 一对计数器吃 89%
+   流量×64 线程；est. 0.3~0.8µs/op）：16 stripes×levels 或采样计数。
+4. **allocator 反震荡**（purge 修复后 shrink 从懒变急，误伤温块的
+   代价真实化）：死区 1MB → max(1MB, 总容量 0.5~1%)；收缩迟滞
+   （grow 立即、shrink 连续 3 轮确认且单轮减半）；稳态自适应拉长
+   interval（1s→5~10s 退避）；per-level 死区（<本层 5% 不动）。
+   预期 hit +0.1~0.3pp。
+5. （可选）大层子缓存内部分片，t256 高命中端才显形。
+
+诚实上限：wlC 下分区有统计复用损失，-0.4pp 已近结构下限，目标是
+持平；命中率正收益在 D/E 与 dynamic SR-HCC（2GB 已 +0.4pp）。
+做完 1~4 预期 8GB 档进入 HCC -2% 以内，dynamic 与 sr_bottom 并拢；
+对第一组（高命中端 C 主导、t256）每 1µs 都直接折算吞吐。
 
 ## 四、实施清单（等当前 run 结束）
 
