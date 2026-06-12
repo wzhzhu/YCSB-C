@@ -1,6 +1,7 @@
 #ifndef YCSB_C_ROCKSDB_DB_H_
 #define YCSB_C_ROCKSDB_DB_H_
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -64,11 +65,13 @@ class RocksdbDB : public DB {
   size_t raw_key_size_bytes_ = 24;
   size_t raw_value_size_bytes_ = 1000;
   std::string raw_value_template_;
-  uint64_t insert_get_ok_count_ = 0;
-  uint64_t insert_get_not_found_count_ = 0;
-  uint64_t insert_get_other_count_ = 0;
-  uint64_t insert_put_ok_count_ = 0;
-  uint64_t insert_put_fail_count_ = 0;
+  // Atomic: incremented concurrently by all load threads; plain uint64_t lost
+  // ~10% of insert_put_ok increments (group commit wakes threads in batches).
+  std::atomic<uint64_t> insert_get_ok_count_{0};
+  std::atomic<uint64_t> insert_get_not_found_count_{0};
+  std::atomic<uint64_t> insert_get_other_count_{0};
+  std::atomic<uint64_t> insert_put_ok_count_{0};
+  std::atomic<uint64_t> insert_put_fail_count_{0};
   std::string last_insert_get_other_status_;
   std::string last_insert_put_fail_status_;
   std::string db_path_;
