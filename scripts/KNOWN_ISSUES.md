@@ -228,9 +228,20 @@
       虽然滞留块 hit 率极低、对命中率几乎无贡献，但对比试验的内存
       预算必须严格）；(b) 这部分预算本可分给 L6。
     - 对照：2GB 档无此现象（L0 仍有文件与流量，usage 5MB=capacity）。
-    - 修复方向：allocator 收缩路径主动回收——对收缩幅度大或流量归零的
-      子缓存触发 purge-to-capacity（HCC 需要暴露一个"淘汰到目标容量"
-      的接口，或粗暴用 EraseUnRefEntries 清排空层）。
+    - **修复（2026-06-12 已实施，待 100GB 验证）**：HCC 新增
+      `PurgeToCapacity()`（`BaseClockTable` 模板方法复用 insert 路径的
+      `Evict` 机制，循环逐出至 usage ≤ capacity，封顶 64 轮防止与并发
+      insert 病态交替；`ClockCacheShard`/`BaseHyperClockCache` 逐层透出）；
+      `MultiLevelCache::ApplyCapacities` 在应用全部新容量后统一对各层 +
+      shared pool 调用（先全量 SetCapacity 再 purge，避免误清正在扩容的
+      层）。改动：`cache/clock_cache.{h,cc}`、`cache/multi_level_cache.cc`。
+    - 冒烟（2M 小库）：L0 排空（0 lookups）时 usage 2.9MB ≤ capacity
+      5.3MB，全部层 usage ≤ capacity 成立；squatting 未复现。
+      934MB 原场景需下一轮 100GB run 复核（看排空层 usage 是否贴住
+      allocator 给的小容量）。
+    - 残留边界：purge 只裁到 capacity，低于 capacity 的陈旧块留待
+      allocator 进一步收缩或自然淘汰（预算已守住，无伤）；被引用中的
+      条目不可逐出，purge 对其放行（freed_count=0 即退出）。
 
 ## 二、Wrapper（ARC/Cacheus）分片设计的边界点
 
