@@ -171,7 +171,10 @@ python3 scripts/run_rocksdb_matrix.py --shard-bits 0,6 --schemes lru,hcc,arc,cac
   filter/index 块极热、命中率接近 1，会抬高混合口径的 `cache_hit_ratio`，
   各策略的真实差异主要体现在 `cache_data_hit_ratio`）
 - `cache_data_hit/miss`、`cache_filter_hit/miss`、`cache_index_hit/miss`（原始计数）
-- `backing_cache_hit_ratio`（RocksDB 全局 `BLOCK_CACHE_HIT/MISS` 口径）
+- `rocksdb_stats_hit_ratio`（RocksDB 全局 `BLOCK_CACHE_HIT/MISS` 口径；注意对
+  `arc/cacheus` 它与 `wrapper_hit_ratio` 同属 wrapper 边界——ticker 由 table
+  reader 在调用 wrapper 的 `Lookup` 后记录，backing 对其不可见——两者应一致到
+  ~1e-6，并非 backing 层指标。旧结果中此列名为 `backing_cache_hit_ratio`）
 - `arc_wrapper_hit_ratio` / `cacheus_wrapper_hit_ratio`（wrapper 策略口径）
 - 上述命中率统计均在每次 run 前重置，仅反映 transaction 阶段
 - `read_attempt_kops` / `write_attempt_kops`

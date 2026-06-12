@@ -127,8 +127,14 @@ COMMON_PROPS = {
     "rocksdb.target_file_size_base": str(64 * 1024 * 1024),
     "rocksdb.write_buffer_size": str(64 * 1024 * 1024),
     "rocksdb.bloom_bits_per_key": "10",
-    "rocksdb.cache_index_and_filter_blocks": "true",
-    "rocksdb.cache_index_and_filter_blocks_with_high_priority": "true",
+    # Keep index/filter OUT of the block cache (pinned in table-reader heap,
+    # max_open_files=-1): the matrix targets data-block policy comparison.
+    # With metadata in cache, ~590KB monolithic index blocks dominated miss
+    # bytes (1GB "metadata wall", KNOWN_ISSUES 一.7) and MLC's allocator
+    # oscillation kept re-faulting hot metadata (一.14). Out-of-cache metadata
+    # costs ~1.05GB RAM beyond cache_size for the 100GB dataset - report this
+    # in the paper. Auxiliary metadata-in-cache arm: flip this back to true.
+    "rocksdb.cache_index_and_filter_blocks": "false",
     # Bypass the OS page cache so block-cache misses pay real NVMe latency.
     # With 250GB RAM vs 100GB data, buffered reads made misses nearly free
     # (warm page cache), decoupling throughput from hit ratio and coupling
@@ -433,7 +439,11 @@ def run_once(
         "cache_filter_miss": f"{metrics.get('cache_filter_miss', 0.0):.0f}",
         "cache_index_hit": f"{metrics.get('cache_index_hit', 0.0):.0f}",
         "cache_index_miss": f"{metrics.get('cache_index_miss', 0.0):.0f}",
-        "backing_cache_hit_ratio": f"{metrics.get('cache_hit_ratio', 0.0):.6f}",
+        # RocksDB statistics (BLOCK_CACHE_HIT/MISS) view. For arc/cacheus this
+        # is measured at the same wrapper boundary as wrapper_hit_ratio (the
+        # backing cache is invisible to these tickers), NOT a backing-layer
+        # metric; the two agree to ~1e-6.
+        "rocksdb_stats_hit_ratio": f"{metrics.get('cache_hit_ratio', 0.0):.6f}",
         "arc_wrapper_hit_ratio": f"{arc_wrapper_hit_ratio:.6f}",
         "cacheus_wrapper_hit_ratio": f"{cacheus_wrapper_hit_ratio:.6f}",
         "mlc_total_hit_ratio": f"{metrics.get('mlc_total_hit_ratio', 0.0):.6f}",
