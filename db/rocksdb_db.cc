@@ -278,15 +278,23 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
         level_capacity = cache_capacity;
       }
       rocksdb::HyperClockCacheOptions per_level = hcc_opts;
-      per_level.capacity = std::max<size_t>(1, level_capacity);
+      // Auto HCC's slot array is mmap-sized once from capacity and cannot grow
+      // beyond it; MLC's allocator raises a hot level far above its equal-split
+      // start (L6 -> ~0.9x total), so reserve for the whole budget and set the
+      // smaller starting capacity afterward. Sizing the mmap at level_capacity
+      // here let Grow() run past the mapping and corrupt the heap.
+      per_level.capacity = std::max<size_t>(1, cache_capacity);
       if (level >= static_cast<size_t>(srhcc_start_level)) {
         per_level.probation_insert = true;
       }
-      sub_caches.emplace_back(per_level.MakeSharedCache());
+      auto sub = per_level.MakeSharedCache();
+      sub->SetCapacity(level_capacity);
+      sub_caches.emplace_back(std::move(sub));
     }
     rocksdb::HyperClockCacheOptions shared_opts = hcc_opts;
-    shared_opts.capacity = 1;
+    shared_opts.capacity = std::max<size_t>(1, cache_capacity);
     auto shared_cache = shared_opts.MakeSharedCache();
+    shared_cache->SetCapacity(0);
     auto cache = std::make_shared<rocksdb::MultiLevelCache>(
         std::move(sub_caches), std::move(shared_cache), cache_capacity);
     cache->SetSharedPoolRatio(

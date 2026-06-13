@@ -272,6 +272,48 @@
     - 冒烟通过（含 Debug 断言库），100GB t64 全量重跑待做——条带化与
       零分配的收益在 t64 高吞吐端才可量化。
 
+17. **【已修复，根因级】MLC 用等分容量构造 Auto HCC 子缓存，mmap 段定死后
+    allocator 大幅增容触发表 Grow 越界，堆损坏**
+    - 现象（mlcopt-calib-20260612-092825）：sr_bottom 两档 summary 全 0
+      （进程 abort）；2GB log 末尾 `corrupted size vs. prev_size in
+      fastbins`，8GB log 空。256MB/2GB-data、t64、skipload 高压下稳定复现
+      （8 轮崩 6~8 次），报错形态随机：`free(): invalid pointer`、
+      `malloc(): smallbin/unsorted double linked list corrupted`、
+      `malloc_consolidate(): invalid chunk size`——典型堆元数据被写坏。
+    - 定位（A/B 逐项排除）：禁用裸透传 opt1 仍崩、禁用反震荡 opt4 仍崩、
+      禁用 PurgeToCapacity 仍崩；唯独 `auto_adjust=false`（不跑 allocator、
+      不调 SetCapacity）不崩 → 锁定到 allocator 的 SetCapacity 调用本身。
+    - 根因：`AutoHyperClockTable` 的 slot 数组是 `MemMapping::AllocateLazyZeroed
+      (sizeof(HandleImpl) * CalcMaxUsableLength(capacity, ...))`，**mmap 段大小
+      在构造时由 capacity 定死，表 Grow 永远不能超出该段**。两条建 MLC 子缓存
+      的路径都按 `level_capacity = total/7` 建 mmap：
+      (a) YCSB `mixed_srhcc` 分支（`rocksdb_db.cc`，sr_bottom 走这条）
+          `per_level.capacity = level_capacity`；
+      (b) rocksdb `MakeSubCacheWithCapacity(hcc_options, level_capacity)`
+          （`multi_level_cache.cc`，dynamic / 非 mixed 走这条）。
+      allocator 把承重层 SetCapacity 抬到 ~0.89×total（约 6×起始），该层实际
+      插入条目数超过初始 mmap 的 max-usable-length → `GrowIfNeeded`→`Grow`
+      写到 mmap 段之外 → 堆损坏。SR-HCC（probation countdown=0）逐出更频繁、
+      表周转更快，最先把表撑到越界临界，故 sr_bottom 必崩；dynamic 同 bug 但
+      没每轮触到临界，**之前所有 MLC run（dataonly/release-calib 单轮）是侥幸
+      没崩，dynamic 的历史数据存在 silent corruption 风险，一并作废重测**。
+    - **修复（2026-06-13）**：两条路径都改为「mmap 按 total_capacity 保留，
+      构造后 SetCapacity 到起始等分值」。
+      (a) `MakeSubCacheWithCapacity(hcc_options, capacity, mmap_capacity)` 新增
+          第三参数，mmap 用 total、随后 `cache->SetCapacity(capacity)`；两处
+          调用传 total_capacity；
+      (b) YCSB mixed_srhcc：`per_level.capacity = cache_capacity` 建 mmap，
+          `sub->SetCapacity(level_capacity)` 设起始；shared 同样按 total 建、
+          SetCapacity(0)。
+      代价：每层 mmap 保留 `CalcMaxUsableLength(total)` 的**虚拟地址**
+      （7 层 + shared，lazy-zeroed 物理按需 commit，48 位地址空间充足），起始
+      slot 元数据略增，可忽略。
+    - 验证：256MB/t64 高压 sr_bottom 8 轮 + dynamic 4 轮（release）+ sr_bottom
+      4 轮（Debug 断言库）全部无崩溃（修复前 8 轮崩 6~8 次）。**本条闭环。**
+    - 残留：Auto HCC 在「SetCapacity 增大超过构造 capacity」下不安全是
+      RocksDB 上游的隐含约束（生产 block cache 很少大幅增容），MLC 是该约束的
+      重度违反者；若未来给 MLC 配「运行时整体 SetCapacity 增大」需复核同一点。
+
 ## 二、Wrapper（ARC/Cacheus）分片设计的边界点
 
 实现：`cache/sharded_wrapper_cache.*`、`cache/wrapper_cache_shard.h`，
