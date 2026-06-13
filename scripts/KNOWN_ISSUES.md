@@ -385,6 +385,46 @@
       RocksDB 上游的隐含约束（生产 block cache 很少大幅增容），MLC 是该约束的
       重度违反者；若未来给 MLC 配「运行时整体 SetCapacity 增大」需复核同一点。
 
+18. **【可选，评测质量】把内存分配器从 glibc malloc 换成 jemalloc**
+    - 现状：jemalloc 未安装（`ldconfig`/`dpkg` 均无），ycsbc 与 librocksdb 均
+      链 glibc malloc（`WITH_JEMALLOC=OFF`）。
+    - 收益（对症）：t64/t128 下 glibc arena 争用是吞吐 run 间噪声主源之一，
+      jemalloc 多 arena + thread cache 降争用 → 方差更小、所需 repeat 更少；
+      碎片更低 → 固定 cache budget 下实际 RSS 更贴近配置容量（可选再上
+      `JemallocNodumpAllocator` 给 block cache 专用，容量口径更干净）；且是
+      RocksDB 官方推荐配置，绝对数更可辩护。
+    - **不能解决**：HCC 命中率非确定性（来自 sharded GCLOCK + 线程交织的算法层，
+      见五.5）；也不会翻转策略对比结论（allocator 对所有方案等量施加，是共享
+      混淆项，A/B 相对关系稳健）——故属"质量增益"而非"有效性必需"。
+    - 成本：装 jemalloc（`apt install libjemalloc-dev` 或源码 build）→ 重链
+      ycsbc / `WITH_JEMALLOC=ON` 重建 librocksdb → **换 allocator = rebaseline，
+      旧绝对数作废**。
+    - 落地路径：(a) 先 `LD_PRELOAD=.../libjemalloc.so ./ycsbc ...` 低成本试水量
+      方差收益，不重建；(b) 确认有效再 `WITH_JEMALLOC=ON` 固化为正式评测标准配置。
+    - **时机建议**：与"100GB 全量 hashed 重跑"（一.1 待补）合并成一次 rebaseline，
+      避免分两次报废历史数据。
+
+19. **YCSB-C 每线程确定性 RNG 改动的方法学辩护 + 多种子待办**
+    - 改了什么：原 YCSB-C 是**所有线程共享一个无锁 `static std::default_random_engine`**，
+      既是数据竞争（UB），又使 run 间 trace 随线程交织漂移、不可复现。改为每线程
+      `thread_local` 独立 engine，种子 = `base_seed + 0x9E3779B97F4A7C15 × stream_id`
+      确定性派生（`core/utils.h` `ThreadLocalRng()`，`YCSB_RNG_SEED` 环境变量可换种子）。
+    - **可辩护性（这是加分项，非作弊）**：
+      (a) 修的是真 UB —— 共享非原子 RNG 无可争议地错；
+      (b) **对齐官方 YCSB** —— Java YCSB 本就每个 client 线程各自一个 Random，我们是
+          拉回 canonical 设计而非偏离；
+      (c) 固定种子是正当的方差削减（common random numbers / paired design），把"抽到
+          哪批 key"这一无关变量消掉，使方案间差异只反映 policy 本身。
+    - **必须说准的边界（避免 over-claim）**：
+      (1) 固定的是**请求 trace（输入）**、与线程调度无关；**不**消除运行时并发效应——
+          线程仍真实争用 cache/锁，吞吐照样反映真实并发（相同负载 + 真实并发）。
+      (2) 因此 **HCC 命中率的 run 间抖动（五.5）不受此改动掩盖**——那是 HCC 运行时
+          sharded GCLOCK + 线程交织的自身非确定性；我们没有把它藏起来。
+      (3) 线程→stream 映射按"首次调用顺序"分配、run 间可变，但**全局访问多重集合一致**
+          （流集合 {1..N} 与各流序列固定），对共享 cache 命中率而言负载严格对齐成立。
+    - **待办（堵住"挑种子"质疑）**：最终结果用 **≥3 个 `YCSB_RNG_SEED`** 跑、报
+      均值/区间，证明结论对种子稳健（机制已内置，仅需在矩阵脚本里加种子维度并汇总）。
+
 ## 二、Wrapper（ARC/Cacheus）分片设计的边界点
 
 实现：`cache/sharded_wrapper_cache.*`、`cache/wrapper_cache_shard.h`，
