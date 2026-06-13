@@ -5,7 +5,7 @@ ROCKSDB_HOME ?= /users/wzhzhu/rocksdb
 # Debug (-O0, assertions on) build: never benchmark against it.
 ROCKSDB_BUILD ?= /mnt/rocksdb_nvme/fio/build/rocksdb-release
 ENABLE_REDIS ?= 0
-CFLAGS=-std=c++20 -O2 -DNDEBUG -g -Wall -pthread -I./ -I$(ROCKSDB_HOME) -I$(ROCKSDB_HOME)/include -DYCSBC_ENABLE_REDIS=$(ENABLE_REDIS)
+CFLAGS=-std=c++20 -O3 -DNDEBUG -g -Wall -pthread -I./ -I$(ROCKSDB_HOME) -I$(ROCKSDB_HOME)/include -DYCSBC_ENABLE_REDIS=$(ENABLE_REDIS)
 LDFLAGS= -L$(ROCKSDB_BUILD) -Wl,-rpath,$(ROCKSDB_BUILD) -lpthread -ltbb -lrocksdb
 ifeq ($(ENABLE_REDIS),1)
 LDFLAGS += -lhiredis

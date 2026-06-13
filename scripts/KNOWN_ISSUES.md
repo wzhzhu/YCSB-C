@@ -6,11 +6,29 @@
 
 ## 一、待验证 / 待办
 
-1. **`insertorder=hashed` 全量回归未做**
+1. **`insertorder` 默认已切回 hashed（YCSB 标准）；100GB 全量 hashed 验证待补**
    - 历史问题：hashed load + block cache 触发 `Corruption: Compaction sees out-of-order keys`，
      根因是 MLC 旧的 64 位前缀 level 编码造成 cache key 混叠，已用 17 字节扩展 key 方案修复并提交。
-   - 现状：矩阵默认仍固定 `insertorder=ordered`（保守起见）。修复后尚未在 100GB 全量 load 下
-     验证 hashed 路径，确认后可考虑恢复 hashed 或将其纳入矩阵维度。
+   - **中等规模验证通过（hashed-smoke-061740，8M 记录、wlC、1GB、开 block cache，
+     hcc/all_levels/dynamic 三方案）**：hashed 灌库 + 事务全程无 corruption，
+     `out-of-order keys` 未复现 → 扩展 key 修复在 hashed 路径下成立。
+   - **`ordered` 是过期 workaround、且系统性扭曲对比**：ordered 顺序灌库几乎全是
+     trivial move，产出"过于干净、层间不重叠"的 LSM，data 集中 → 全局 HCC 占优；
+     hashed 产出真实重叠 LSM，一次 Get 探多层 → MLC 按层缓存反而获益。同 8M/wlC/1GB：
+
+     | 方案 | ordered hit | hashed hit |
+     |---|---|---|
+     | hcc | 0.707 | 0.539 |
+     | mlc_hcc_all_levels | 0.651 | 0.598 |
+     | mlc_hcc_dynamic_srhcc | 0.654 | 0.644 |
+
+     ordered 下 HCC 赢、hashed 下 MLC 赢（dynamic +10pp）。故继续用 ordered 既偏离
+     YCSB 默认、又对 MLC 不利且不真实。
+   - **处置（2026-06-13）**：`run_rocksdb_matrix.py` 的 `COMMON_PROPS["insertorder"]`
+     与 `--insert-order` 默认均改为 `hashed`；`ordered` 保留作受控对照（`--insert-order
+     ordered`）。
+   - **待补**：100GB 全量 hashed load 的最终闭环验证（中等规模已证伪 corruption，
+     全量为彻底确认；耗时较长，稍后做）。
 
 2. **正式矩阵尚未在新默认配置下完整跑过**
    - 新默认：O_DIRECT（读 + flush/compaction）、`operationcount=20M`、
@@ -231,6 +249,12 @@
     - 残余待办：用 release 构建重跑 100GB 标定（C、r、各档吞吐），
       更新 EXPERIMENT_PLAN 模型常数；正式实验一律用 release 构建
       （`build-tests` 仅留作调试断言用途）。
+    - **优化级别对齐（2026-06-13）**：三个 YCSB Makefile 由 `-O2` 提到 `-O3`，
+      与 librocksdb（Release `-O3 -DNDEBUG`）一致。残留可辩护性事项（未做）：
+      (a) 内存分配器仍是 glibc malloc（`WITH_JEMALLOC=OFF`），高线程下争用大、
+      run 间噪声高（与 HCC 命中率非确定性互相叠加，见五.5），最终评测建议换
+      jemalloc/tcmalloc 重标定；(b) release 用了 `-march=native`，跨机不可复现，
+      方法学需注明。
 
 14. **MLC 吞吐落后单体（probe 轮 8GB：226 vs LRU 425 kops）的归因分解**
     - 单 op 时延差 131µs（282 vs 151µs@t64），其中 **I/O 侧只占 ~5µs**：

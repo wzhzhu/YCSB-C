@@ -130,9 +130,14 @@ COMMON_PROPS = {
     # Approximate 24-byte key with "user" + zero-padded numeric suffix.
     "zeropadding": "20",
     "field_len_dist": "constant",
-    # Keep load order stable to avoid random-insert compaction corruption
-    # on the current RocksDB branch under high-volume YCSB runs.
-    "insertorder": "ordered",
+    # YCSB-standard hashed insert: produces a realistic overlapping LSM (real
+    # compaction, not all-trivial-move) so a Get probes multiple levels. The
+    # earlier "ordered" workaround for random-insert compaction corruption is
+    # obsolete (root cause was MLC cache-key aliasing, fixed via the 17-byte
+    # extended key; revalidated corruption-free under hashed load, KNOWN_ISSUES
+    # 一.1). Ordered also masked the policy comparison (clean LSM favored the
+    # global HCC; under hashed MLC's per-level caching wins even on wlC).
+    "insertorder": "hashed",
     "rocksdb.raw_kv_mode": "true",
     "rocksdb.raw_key_size_bytes": "24",
     "rocksdb.raw_value_size_bytes": "1000",
@@ -216,8 +221,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--insert-order",
         choices=["ordered", "hashed"],
-        default="ordered",
-        help="YCSB key insert order for load/transaction key mapping.",
+        default="hashed",
+        help="YCSB key insert order for load/transaction key mapping. Default "
+        "hashed (YCSB standard, realistic overlapping LSM); ordered kept for "
+        "controlled comparison.",
     )
     p.add_argument(
         "--refill-policy",
