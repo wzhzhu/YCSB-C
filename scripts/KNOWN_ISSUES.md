@@ -83,8 +83,27 @@
      （2GB：0.623 vs 0.581/0.571），策略价值已可见；但吞吐只有 LRU/HCC 的
      60~70%，wrapper 每操作开销仍可观。
 
-9. **Cacheus 大容量段命中率反转为全场最差，待定位**
-   - 现象（probe-20260610-074612, wlC/t64/s6 的 data_hit_ratio）：
+9. **[已关闭 2026-06-13] Cacheus 大容量段命中率反转 —— 证伪，系测量噪声**
+   - **结论**：确定性多 repeat YCSB 对照（determ-cacheus-20260613，YCSB_RNG_SEED=0，
+     wlC/t64/s6，2/4/8GB ×3）证实 Cacheus 在所有容量都 **≥ LRU**，且随容量
+     收敛、从不反转：
+
+     | cache | LRU | Cacheus | Δ |
+     |---|---|---|---|
+     | 2GB | 0.6281 | 0.6703 | +4.2pp |
+     | 4GB | 0.6736 | 0.6988 | +2.5pp |
+     | 8GB | 0.7186 | 0.7267 | +0.8pp |
+
+     三次 repeat 的 hit_ratio 一致到小数点后 4~5 位（RNG 修复后 trace 完全确定）。
+     之前 probe 跑出的 8GB "−3pp 反转"确认为**多线程 RNG 数据竞争**导致不同方案
+     看到不同 trace 的测量噪声（见本档"YCSB 随机性"条目，已于 6d9139a 修复）。
+     微基准（DISABLED_*Diagnostic）与确定性 YCSB 两条独立证据吻合，Cacheus 策略
+     本身无 bug。下方原始排查记录保留备查。
+   - 吞吐侧（非本条问题）：Cacheus 命中率更高但吞吐比 LRU 低 10~18%
+     （789/767/801 vs 873/933/960 kops），系 wrapper 簿记 + backing 二次查找开销。
+
+   ---
+   原始记录（probe-20260610-074612, wlC/t64/s6 的 data_hit_ratio）：
      1GB 0.429、2GB 0.626 时为四方案最优（高压区自适应优势成立），
      但曲线快速饱和（4GB 0.661 < ARC 0.674），8GB 仅 0.678，
      **低于 LRU 0.704 / HCC 0.708 / ARC 0.705 约 3pp**。
@@ -416,3 +435,93 @@
 
 4. **zipfian(0.99) + 1 亿 key 极度倾斜**：1% 容量即可获得较高 data 块命中率（~31%），
    高 hit ratio 不代表测试无效，需结合 `cache_data_hit_ratio` 判断。
+
+## 五、MLC 命中率提升排查（2026-06-13）
+
+1. **微基准可复现 ARC > LRU > HCC 的命中率排名**（rocksdb/cache/cacheus_cache_test.cc
+   的 `DISABLED_PolicyCountdownDiagnostic`，zipfian α=0.99，真实 8KB 块，s0）：
+
+   | 覆盖率 | LRU | HCC | ARC | Cacheus |
+   |---|---|---|---|---|
+   | 0.05 | 0.7047 | **0.6798** | 0.7272 | 0.7374 |
+   | 0.10 | 0.7653 | 0.7490 | 0.7817 | 0.7901 |
+   | 0.20 | 0.8296 | 0.8214 | 0.8363 | 0.8408 |
+   | 0.40 | 0.8981 | 0.8970 | 0.8996 | 0.9034 |
+
+   低覆盖区 HCC 不仅落后 ARC ~4.7pp，连纯 LRU 都比它高 ~2.5pp；差距随容量收敛。
+   这正是 MLC 各层小预算所处区间，解释了 MLC（HCC 子缓存）在 wlC 上为何贴近
+   LRU/HCC 而追不上 ARC。
+
+2. **杠杆 A（加深无锁 GCLOCK countdown）实测基本无效**——已否决。
+   把 `kMaxCountdown` 临时改成 env 可调（`ROCKSDB_HCC_MAX_COUNTDOWN`，仅原型，
+   已撤销回常量 3），扫 3/5/7/10：
+
+   | 覆盖率 | cd=3 | cd=5 | cd=7 | cd=10 |
+   |---|---|---|---|---|
+   | 0.05 | 0.6798 | 0.6817 | 0.6821 | 0.6825 |
+   | 0.10 | 0.7490 | 0.7508 | 0.7512 | 0.7514 |
+
+   低覆盖区仅 +0.27pp 且 cd=7 即饱和，远不足以补 4.7pp 的 ARC 差距。
+
+3. **差距的机制分解**：
+   - HCC < LRU（−2.5pp）：CLOCK 用 2-bit 计数 + 扫描序逐出，是 LRU 精确 recency
+     顺序的有损近似；加深计数器属于"频率"轴，补不回"recency 精度"轴的损失。
+   - LRU < ARC（−2.2pp）：ARC 的优势来自 B1/B2 幽灵链表对"刚逐出又回来"的块的
+     自适应记忆与 recency/frequency 配比，GCLOCK 没有等价的逐出记忆机制。
+
+4. **结论与方向**（同质负载 wlC 上）：
+   - HCC/MLC 的命中率天花板≈LRU，结构性低于 ARC，且无法靠 countdown 调参补齐；
+     不应继续在频率深度上投入。
+   - 真正能补 ARC 差距的唯一无锁杠杆是给子缓存加**无锁幽灵/准入过滤**
+     （原子数组实现的 counting-bloom / clock-ghost，复刻 ARC B1/B2 的逐出记忆），
+     工程量较大，待评估收益后再决定是否做。
+   - 更对路的是杠杆 B：把 MLC 的卖点定位为"无锁并发 + 分层"，命中率优势放到
+     **异质负载**（wlD latest、wlE scan、hotspot）上兑现——此时按 level 隔离/特化
+     能结构性超过全局缓存，而非在同质 wlC 上硬追 ARC。对应 EXPERIMENT_PLAN.md
+     待实现的 hotspot/zipfian_const/request-dist 维度。
+
+5. **杠杆 B 兑现：隔离负载（ISO）上 MLC 反超 HCC +7.7pp**（2026-06-13）
+   - 负载 `workloads/workloadiso.spec`：80% read-`latest` + 20% scan，readonly，
+     `scankeydistribution=uniform`（解耦 scan 起始键分布，见 e15aa2a）。
+     读热集打浅层 L0（高复用），扫描打深层 L6（低复用、污染流）——制造
+     "按层分离的污染流"，正是 MLC 的干净主场。
+   - **data-size cap（rocksdb `MultiLevelAllocationOptions::cap_at_data_size`，
+     默认开）**：指数 MRC 模型会给"热但小"的层（如 L0）远超其数据量的容量，
+     surplus 空置而深层饿死。cap 把每层容量上界设为 `data_size × 1.10`
+     （空层给 `empty_level_cap_bytes`=64KB），加了上界的注水解再把 surplus
+     分给高边际层。改动：`cache/multi_level_cache_allocator.{h,cc}`。
+   - 结果（iso-capfix2-053426，同一 DB，1GB/t16，2M ops）：
+
+     | 方案 | hit_ratio | 吞吐 Kops/s |
+     |---|---|---|
+     | hcc | 0.616 | 145 |
+     | mlc_hcc_all_levels | **0.693** | 150 |
+     | mlc_hcc_sr_bottom | **0.693** | 143 |
+     | mlc_hcc_dynamic_srhcc | **0.695** | 145 |
+
+   - cap 在 per-level 上精确生效（all_levels）：L0 cap=95.5MB≈data(86.9MB)×1.10、
+     命中 0.990（read-latest 完全隔离扫描污染）；L1–L4 空层各仅 204B（修复前
+     每层浪费 ~143MB）；回收预算精确流向 L5(541MB/data 515MB,0.897)、
+     L6(436MB/data 1462MB,0.338)。各层容量和 = 1GB。
+
+6. **【教训】所谓"AutoHCC 动态调容堆损坏"= ABI 不匹配，非 AutoHCC bug**
+   （2026-06-13，闭环；一.17 的"mmap 越界"是另一独立问题，已闭环）
+   - 现象：上 data-size cap 后，`mlc_hcc_all_levels`/`sr_bottom` 启动即
+     `corrupted size vs. prev_size`，summary 全 0。曾误判为 AutoHCC 的
+     `PurgeToCapacity`/`Evict` 后台并发或动态 SR-HCC 切换的堆损坏。
+   - 定位：(a) 并发压力测试（直接 hammer `AdjustCapacities`+purge+真实 deleter）
+     反复跑均**干净**；(b) gdb 抓真实崩溃栈落在 **`CoreWorkload::Init`(主线程、
+     启动期)**，`executed_ops=0`，事务线程未起——**非事务期并发**；
+     (c) ASAN 库精确定位：`heap-buffer-overflow WRITE size 8` 于
+     **`MultiLevelCacheAllocator` 构造函数**，写在 344B 对象右侧 0 字节处，
+     分配点 `rocksdb_db.cc:539` 的 `make_unique<MultiLevelCacheAllocator>`。
+   - 根因：给 `.h` 的 `MultiLevelAllocationOptions` 加字段后
+     `sizeof(MultiLevelCacheAllocator)` 变大，但 **`ycsbc` 二进制是改头之前编的**，
+     `operator new` 按旧 size 分配、`.so` 构造函数按新 size 写成员 → 越界。
+     单测从不复现是因为测试与库同次构建、头/库一致；只有独立编译、头文件
+     过期的 `ycsbc` 才崩。
+   - 修复：重编 `ycsbc`（让 `rocksdb_db.cc` 用新头）→ ASAN 零报错跑完 2M ops。
+   - **铁律**：凡改 `rocksdb` 中被 `rocksdb_db.cc` 直接实例化的公共头
+     （尤其 `multi_level_cache_allocator.h` 的 struct/类布局），**必须连带重编
+     `ycsbc`**（`make` 不追踪头依赖，需 `touch db/rocksdb_db.cc` 或 `make clean`）。
+     否则任何 sizeof 变化都会以"随机堆损坏"形式爆雷，极易误导为缓存并发 bug。
