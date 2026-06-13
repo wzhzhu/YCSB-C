@@ -108,6 +108,34 @@
    - 待办：(a) 给 router 的 stats 聚合补 usage（或跑 8GB 单实例 s0 读
      单体 printable options）；(b) 8GB 档复测定位。
 
+   - **结论（2026-06-13，受控微基准排查，rocksdb/cache/cacheus_cache_test.cc
+     的 4 个 DISABLED 诊断用例）**：在 zipfian(α=0.99) 合成 trace 上，跨
+     【纯策略 / 真实 Lookup-Insert 路径 / 均匀 16KB 块 / 变长 4–32KB 块 /
+     s0 单实例 / s6 64 分片 / 0.5×–16× 覆盖】所有维度，**Cacheus 命中率始终
+     ≥ LRU**，大容量处收敛为持平（最差 delta = -0.0001，纯噪声），从未出现
+     有意义的负回退。
+     - 容量利用不足假说被**证伪**：`RealPathDeepDump` 一度观察到影子 usage
+       卡在 3071/20000（15%）、零逐出，疑似 bug；但 `BackingIsolation` 证明
+       **裸 HCC（cap=1.37MB, charge=1）同样只装 3071 条目、命中 0.666**——
+       根因是 HCC 每条目 ~445B 元数据开销，charge=1 时开销完全主导，与
+       Cacheus 无关。改用真实块大小（≥8KB，开销占比 <5%）后该假象消失，
+       Cacheus 影子容量正常填满、正常逐出。
+     - 因此 (a)(b)(c) 三点机制归因**在合成 zipfian 上均未实测到可观测的命中率
+       损失**；KNOWN_ISSUES 担心的 "Q 准入瓶颈致大容量反转" 没有被复现。
+   - **重新定位 YCSB 8GB 回退（3–4pp）的可疑来源**（按优先级）：
+     (1) **测量噪声 / 单次运行**：probe / mlcopt 均为单 repeat。
+     (2) **多线程 RNG 数据竞争**（见本档 YCSB 随机性条目）：`utils::RandomDouble`
+         共享 `std::default_random_engine`，多线程下 trace 非确定，
+         不同方案的 run 可能看到不同请求序列，3–4pp 完全可由 trace 方差解释。
+     (3) 真实 RocksDB 块访问序列 ≠ 纯 key zipfian（块内多 key、预取等）。
+   - **建议**：先排除 (1)(2)——用单线程或固定 per-thread 种子做一次确定性、
+     多 repeat 的 LRU vs Cacheus YCSB 对照；若回退在确定性条件下消失，则确认
+     为噪声/trace 方差，Cacheus 策略本身无 bug，本条可关闭。
+   - 备注（既有测试债，非本问题）：`cacheus_cache_test.cc` 中既有用例
+     （BasicInsertLookup 等）用 4 字节 key，与 HCC backing 要求的 16 字节
+     cache key 冲突，Debug 下触发 `clock_cache.h:1134` assert 中止。新增的
+     诊断用例已改用 16 字节 key。建议后续统一修正既有用例的 key 长度。
+
 10. **Cacheus wrapper 每操作成本为四方案最重**
     - 单 op 时延（64 线程换算）：Cacheus 310~380µs vs ARC 215~250µs vs
       LRU/HCC ~150µs。64 分片已消除锁争用，剩余为每操作记账本身
