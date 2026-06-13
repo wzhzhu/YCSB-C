@@ -109,6 +109,15 @@ for _base in ("mlc_hcc_sr_bottom", "mlc_hcc_all_levels", "mlc_hcc_dynamic_srhcc"
         "rocksdb.multi_level_cache_use_effective_data_size": "true",
     }
 
+# No-cap variants: disable the data-size capacity cap (cap_at_data_size) so the
+# allocator may over-allocate hot-but-small levels. Used for controlled A/B
+# against the default (cap-on) base schemes to isolate the cap's contribution.
+for _base in ("mlc_hcc_sr_bottom", "mlc_hcc_all_levels", "mlc_hcc_dynamic_srhcc"):
+    SCHEMES[f"{_base}_nocap"] = {
+        **SCHEMES[_base],
+        "rocksdb.multi_level_cache_cap_at_data_size": "false",
+    }
+
 COMMON_PROPS = {
     "workload": "com.yahoo.ycsb.workloads.CoreWorkload",
     # 100GB with 1024B KV assumption => 104,857,600 records.

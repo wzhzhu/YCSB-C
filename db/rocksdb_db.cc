@@ -497,6 +497,15 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
         0.1);
     alloc_opts.compaction_shift_debug = ParseBool(
         props, "rocksdb.multi_level_cache_compaction_shift_debug", false);
+    // Data-size cap (cap a level's capacity at data_size * margin so the
+    // surplus flows to undersaturated deep levels). Default matches the
+    // allocator header default; exposed here for controlled A/B.
+    alloc_opts.cap_at_data_size = ParseBool(
+        props, "rocksdb.multi_level_cache_cap_at_data_size",
+        alloc_opts.cap_at_data_size);
+    alloc_opts.data_cap_margin_ratio = ParseDouble(
+        props, "rocksdb.multi_level_cache_data_cap_margin_ratio",
+        alloc_opts.data_cap_margin_ratio);
 
     const std::string mode = props.GetProperty(
         "rocksdb.multi_level_cache_allocator_mode", "model");

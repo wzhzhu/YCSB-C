@@ -503,6 +503,26 @@
      命中 0.990（read-latest 完全隔离扫描污染）；L1–L4 空层各仅 204B（修复前
      每层浪费 ~143MB）；回收预算精确流向 L5(541MB/data 515MB,0.897)、
      L6(436MB/data 1462MB,0.338)。各层容量和 = 1GB。
+   - **受控 A/B 验证（ab-iso-cap-055420 / ab-wlc-cap-055905，YCSB_RNG_SEED=0，
+     同一 DB，新增 `rocksdb.multi_level_cache_cap_at_data_size` prop +
+     `*_nocap` 方案变体，cap-on/off 两侧仅差此一标志、共用同一 release 库）**：
+     - ISO @1GB 2 repeats，**cap 干净贡献 +2.7pp**（两方案一致，吞吐亦升）：
+
+       | 方案 | cap-on | cap-off |
+       |---|---|---|
+       | all_levels | 0.6905 | 0.6633 |
+       | dynamic_srhcc | 0.6922 | 0.6650 |
+
+     - wlC（同质，8M 记录）@1/4GB，**cap-on≈cap-off，差异全在 ±0.0004 噪声内
+       → 无回退**（cap 在无"热小层+空置 surplus"的负载上是 no-op）。故
+       `cap_at_data_size` 默认开是安全的。
+     - **附带发现：HCC 命中率 run 间非确定**——ISO @1GB 同一 DB、同种子，
+       HCC 两次 repeat 0.6138 vs 0.6943（**抖 8pp**），系分片 GCLOCK 逐出对
+       线程交错敏感；MLC（per-level、unsharded）则确定到小数点后 3 位。
+       **教训：MLC-vs-HCC 对比必须给 HCC 多 repeat 取均值/置信区间**，
+       单次 HCC 采样会严重误导（之前误判的"DB 方差"实为此）。
+     - wlC 上 HCC 命中率仍 ≥ MLC（0.707/0.800 vs 0.651/0.786），与"同质负载
+       HCC 全局缓存占优、MLC 主场在异质/隔离"一致，与 cap 无关。
 
 6. **【教训】所谓"AutoHCC 动态调容堆损坏"= ABI 不匹配，非 AutoHCC bug**
    （2026-06-13，闭环；一.17 的"mmap 越界"是另一独立问题，已闭环）
