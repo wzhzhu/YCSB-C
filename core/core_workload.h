@@ -106,6 +106,16 @@ class CoreWorkload {
   ///
   static const std::string REQUEST_DISTRIBUTION_PROPERTY;
   static const std::string REQUEST_DISTRIBUTION_DEFAULT;
+
+  ///
+  /// The name of the property for the distribution of SCAN start keys, used to
+  /// decouple scan targets from point-read targets (e.g., reads hit recently
+  /// written keys in shallow LSM levels while scans sweep the old bulk in deep
+  /// levels). Options: "" / "same" (use request distribution), "uniform",
+  /// "zipfian" - the latter two range over the loaded keyspace [0, recordcount).
+  ///
+  static const std::string SCAN_KEY_DISTRIBUTION_PROPERTY;
+  static const std::string SCAN_KEY_DISTRIBUTION_DEFAULT;
   
   ///
   /// The name of the property for adding zero padding to record numbers in order to match 
@@ -152,6 +162,7 @@ class CoreWorkload {
   virtual std::string NextTable() { return table_name_; }
   virtual std::string NextSequenceKey(); /// Used for loading data
   virtual std::string NextTransactionKey(); /// Used for transactions
+  virtual std::string NextScanStartKey(); /// Scan start key (decoupled dist)
   virtual Operation NextOperation() { return op_chooser_.Next(); }
   virtual std::string NextFieldName();
   virtual size_t NextScanLength() { return scan_len_chooser_->Next(); }
@@ -162,14 +173,15 @@ class CoreWorkload {
   CoreWorkload() :
       field_count_(0), read_all_fields_(false), write_all_fields_(false),
       field_len_generator_(NULL), key_generator_(NULL), key_chooser_(NULL),
-      field_chooser_(NULL), scan_len_chooser_(NULL), insert_key_sequence_(3),
-      ordered_inserts_(true), record_count_(0) {
+      scan_key_chooser_(NULL), field_chooser_(NULL), scan_len_chooser_(NULL),
+      insert_key_sequence_(3), ordered_inserts_(true), record_count_(0) {
   }
   
   virtual ~CoreWorkload() {
     if (field_len_generator_) delete field_len_generator_;
     if (key_generator_) delete key_generator_;
     if (key_chooser_) delete key_chooser_;
+    if (scan_key_chooser_) delete scan_key_chooser_;
     if (field_chooser_) delete field_chooser_;
     if (scan_len_chooser_) delete scan_len_chooser_;
   }
@@ -186,6 +198,7 @@ class CoreWorkload {
   Generator<uint64_t> *key_generator_;
   DiscreteGenerator<Operation> op_chooser_;
   Generator<uint64_t> *key_chooser_;
+  Generator<uint64_t> *scan_key_chooser_;  // nullptr => reuse key_chooser_
   Generator<uint64_t> *field_chooser_;
   Generator<uint64_t> *scan_len_chooser_;
   CounterGenerator insert_key_sequence_;
@@ -215,6 +228,15 @@ inline std::string CoreWorkload::BuildKeyName(uint64_t key_num) {
   int zeros = zero_padding_ - key_num_str.length();
   zeros = std::max(0, zeros);
   return std::string("user").append(zeros, '0').append(key_num_str);
+}
+
+inline std::string CoreWorkload::NextScanStartKey() {
+  if (scan_key_chooser_ == nullptr) {
+    return NextTransactionKey();
+  }
+  // Scan start keys range over the loaded keyspace [0, recordcount); all such
+  // keys are always present, so no insert-frontier guard is needed.
+  return BuildKeyName(scan_key_chooser_->Next());
 }
 
 inline std::string CoreWorkload::NextFieldName() {

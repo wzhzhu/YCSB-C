@@ -20,6 +20,7 @@ WORKLOAD_SPECS = {
     "D": "workloads/workloadd.spec",
     "E": "workloads/workloade.spec",
     "F": "workloads/workloadf.spec",
+    "ISO": "workloads/workloadiso.spec",
 }
 
 SCHEMES = {

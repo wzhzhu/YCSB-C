@@ -67,6 +67,10 @@ const string CoreWorkload::SCAN_LENGTH_DISTRIBUTION_PROPERTY =
     "scanlengthdistribution";
 const string CoreWorkload::SCAN_LENGTH_DISTRIBUTION_DEFAULT = "uniform";
 
+const string CoreWorkload::SCAN_KEY_DISTRIBUTION_PROPERTY =
+    "scankeydistribution";
+const string CoreWorkload::SCAN_KEY_DISTRIBUTION_DEFAULT = "";
+
 const string CoreWorkload::INSERT_ORDER_PROPERTY = "insertorder";
 const string CoreWorkload::INSERT_ORDER_DEFAULT = "hashed";
 
@@ -155,7 +159,22 @@ void CoreWorkload::Init(const utils::Properties &p) {
   } else {
     throw utils::Exception("Unknown request distribution: " + request_dist);
   }
-  
+
+  // Optional decoupled scan start-key distribution over the loaded keyspace.
+  // Lets scans sweep the old bulk (deep LSM levels) while point reads (e.g.
+  // latest) hit recently written keys in shallow levels.
+  std::string scan_key_dist = p.GetProperty(SCAN_KEY_DISTRIBUTION_PROPERTY,
+                                            SCAN_KEY_DISTRIBUTION_DEFAULT);
+  if (scan_key_dist.empty() || scan_key_dist == "same") {
+    scan_key_chooser_ = nullptr;
+  } else if (scan_key_dist == "uniform") {
+    scan_key_chooser_ = new UniformGenerator(0, record_count_ - 1);
+  } else if (scan_key_dist == "zipfian") {
+    scan_key_chooser_ = new ScrambledZipfianGenerator(record_count_);
+  } else {
+    throw utils::Exception("Unknown scan key distribution: " + scan_key_dist);
+  }
+
   field_chooser_ = new UniformGenerator(0, field_count_ - 1);
   
   if (scan_len_dist == "uniform") {

@@ -115,7 +115,7 @@ inline int Client::TransactionReadModifyWrite() {
 
 inline int Client::TransactionScan() {
   const std::string &table = workload_.NextTable();
-  const std::string &key = workload_.NextTransactionKey();
+  const std::string &key = workload_.NextScanStartKey();
   int len = workload_.NextScanLength();
   std::vector<std::vector<DB::KVPair>> result;
   if (!workload_.read_all_fields()) {
