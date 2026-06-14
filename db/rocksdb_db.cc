@@ -432,6 +432,8 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
   options.use_direct_io_for_flush_and_compaction = ParseBool(
       props, "rocksdb.use_direct_io_for_flush_and_compaction", false);
   options.allow_mmap_reads = ParseBool(props, "rocksdb.allow_mmap_reads", false);
+  wait_for_compact_before_txn_ =
+      ParseBool(props, "rocksdb.wait_for_compact_before_transactions", false);
   options.statistics = rocksdb::CreateDBStatistics();
   statistics_ = options.statistics;
 
@@ -946,6 +948,22 @@ RocksdbDB::~RocksdbDB() {
 }
 
 void RocksdbDB::ResetStats() {
+  // Called once in main() at the load->transaction boundary. Drain background
+  // compaction here so every scheme measures against an identical, stable LSM.
+  // Mirrors db_bench's waitforcompaction step exactly (default
+  // WaitForCompactOptions: no flush, no purge; preceded by a 5s sleep so any
+  // post-load background work is actually scheduled before we wait). Using
+  // flush=true/wait_for_purge=true here deadlocked the close path, so we keep
+  // the proven db_bench recipe. Runs for skipload cases too (fast no-op when
+  // the DB is already quiescent).
+  if (wait_for_compact_before_txn_ && db_ != nullptr) {
+    db_->GetEnv()->SleepForMicroseconds(5 * 1000000);
+    rocksdb::Status s = db_->WaitForCompact(rocksdb::WaitForCompactOptions());
+    if (!s.ok()) {
+      std::cerr << "# WaitForCompact before transactions failed: "
+                << s.ToString() << std::endl;
+    }
+  }
   if (statistics_ != nullptr) {
     statistics_->Reset();
   }

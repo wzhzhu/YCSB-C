@@ -62,6 +62,12 @@ class RocksdbDB : public DB {
   std::unique_ptr<rocksdb::MultiLevelCacheAllocator> multi_level_allocator_;
   std::shared_ptr<rocksdb::Statistics> statistics_;
   bool raw_kv_mode_ = false;
+  // When set, ResetStats() (called once at the load->transaction boundary) waits
+  // for all background compaction to drain so the LSM is in a stable, natural
+  // multi-level steady state before the measured phase. Makes every scheme's
+  // transaction phase see an identical LSM (fair A/B); does NOT collapse levels
+  // like a full CompactRange would.
+  bool wait_for_compact_before_txn_ = false;
   size_t raw_key_size_bytes_ = 24;
   size_t raw_value_size_bytes_ = 1000;
   std::string raw_value_template_;

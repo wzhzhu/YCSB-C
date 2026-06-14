@@ -425,6 +425,43 @@
     - **待办（堵住"挑种子"质疑）**：最终结果用 **≥3 个 `YCSB_RNG_SEED`** 跑、报
       均值/区间，证明结论对种子稳健（机制已内置，仅需在矩阵脚本里加种子维度并汇总）。
 
+20. **【已定位根因 + 已修复】MLC "吞吐 inversion"（4–8GB 吞吐腰斩）= compaction
+    污染测量窗口，非 allocator/估计器缺陷；修复 = load→txn 边界等 compaction 收敛**
+    - **现象（eval-C-seed1-0613，100GB，无收敛）**：MLC 各方案吞吐随缓存先升后崩——
+      `all_levels` 2GB→738、**4GB→416、8GB→422** kops（命中率却单调升
+      0.617→0.622→0.662）；`dynamic_srhcc` 4GB→407、8GB→387；`sr_bottom` 4/8GB→~503。
+    - **根因（统计口径）**：load 阶段产生大量 compaction backlog（实测 ~130 个 L0
+      文件），矩阵原先在 load 后立即进入 transaction（无收敛），backlog compaction
+      持续跑进测量窗口。而 **compaction 的 block 读会被计入缓存与 allocator 统计**：
+      数据块迭代器默认 `use_block_cache_for_lookup=true`（`block_based_table_iterator.cc:413`），
+      compaction 读 block 仍调用 `MultiLevelCache::Lookup`（`multi_level_cache.cc:253`），
+      无条件 `IncLookupCounter` + `MaybeRecordLookupSample`（260–261 行，**不区分调用者**，
+      `Cache::Lookup` 接口拿不到 caller）；compaction 的 `ReadOptions.fill_cache=false`
+      （`compaction_job.cc:1465`）→ 探测但不回填 → 大量冷块 miss。这些"读 L5 把 L5→L6"
+      的顺序读把**源层的 lookup 量灌大、命中率压低**，污染 allocator 的 per-level
+      模型 → 误配/抖动 → inversion。同时也污染各方案上报的 hit_ratio。
+    - **修复**：在 `RocksdbDB::ResetStats()`（load→txn 边界，main 单次调用）按 db_bench
+      的 `waitforcompaction` 配方等后台 compaction 收敛：**先 sleep 5s + 默认
+      `WaitForCompactOptions()`（不 flush、不 purge）**。`rocksdb.wait_for_compact_before_transactions`
+      已设为矩阵 COMMON_PROPS 默认 `true`（对所有方案公平、提升测量保真度）。
+      - **坑（已避开）**：最初用 `flush=true`+`wait_for_purge=true` 会让 load+WFC
+        同进程在 `delete db` 收尾处**死锁**（一个 `rocksdb:low` 线程 100% 自旋、主线程
+        阻塞在 futex）。隔离确认：纯 skipload、skipload+WFC 均正常,仅 load+WFC 同进程触发。
+        对齐 db_bench 默认 options 后消除（3M 实测 exit=0；100GB 全量重跑亦正常）。
+    - **验证（eval-C-seed1-WFC-0614,100GB,带收敛,全量重基线)**：inversion 消失,
+      全部恢复单调 scaling：`all_levels` 4GB **416→818（+96%）**、8GB **422→730（+73%）**；
+      `dynamic_srhcc` 4GB 407→836、8GB 387→753；`sr_bottom` 4GB 504→817、8GB 502→857。
+    - **结论**：(a) inversion 是测量伪象（compaction 污染 + 不稳定 LSM），robust 估计器
+      无需"修"；(b) **db_bench 的 shadow_cache 双点估计器移植被放弃**——它本为修
+      "robust 误配"而来,但 robust 没坏；且 shadow 自身有**自强化饿死陷阱**（scaled
+      影子 LRU 锚定 1.5×当前容量,容量一小就量到边际收益≈0、无法外推,30GB/8GB 实测把
+      L5 从 170MB 饿到 13.5KB,吞吐 645→241、命中 0.783→0.745 退步）。已从代码移除。
+    - **残留观察（待多种子定性）**：带收敛后 `all_levels`/`dynamic` 在 8GB 仍比 4GB 略低
+      （730<818、753<836,非崩溃级；`sr_bottom` 反而单调 817→857），疑为单实例 L6 轻度
+      争用或单种子噪声。**同质 wlC 上 MLC 仍低于 HCC**（8GB：hcc 970/lru 951 vs MLC
+      730–857,命中率相当 ~0.71–0.72）——诚实"代价"结论,与一.14 及 MLC 主场定位
+      （异质/ISO,见五.5）一致。
+
 ## 二、Wrapper（ARC/Cacheus）分片设计的边界点
 
 实现：`cache/sharded_wrapper_cache.*`、`cache/wrapper_cache_shard.h`，

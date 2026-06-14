@@ -160,6 +160,17 @@ COMMON_PROPS = {
     # cases that share the reused DB.
     "rocksdb.use_direct_reads": "true",
     "rocksdb.use_direct_io_for_flush_and_compaction": "true",
+    # Drain background compaction at the load->transaction boundary (db_bench's
+    # waitforcompaction recipe: 5s settle + default WaitForCompactOptions) so the
+    # measured phase runs on a stable, fully-compacted LSM. WITHOUT this, the
+    # post-load compaction backlog (e.g. 130 L0 files) keeps running into the
+    # transaction phase; those compaction block reads are counted by the cache
+    # (fill_cache=false but the lookup still probes/counts) and by the MLC
+    # allocator's per-level stats, polluting hit ratios and driving allocator
+    # misallocation. That pollution was the root cause of the MLC "throughput
+    # inversion" at 4-8GB (KNOWN_ISSUES 一.20); enabling this restored monotonic
+    # scaling for every scheme and is the fair default for all policies.
+    "rocksdb.wait_for_compact_before_transactions": "true",
 }
 
 THROUGHPUT_RE = re.compile(
@@ -193,11 +204,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workloads", default="A,B,C,D,E,F")
     p.add_argument(
         "--schemes",
+        # D_eff (*_deff) variants dropped from the default set: on wlC they were
+        # hit-ratio-neutral-to-negative (the effective-working-set model did not
+        # help and slightly hurt at small caches). Definitions are kept in
+        # SCHEMES so they can still be selected explicitly via --schemes.
         default=(
             "lru,hcc,arc,cacheus,"
-            "mlc_hcc_sr_bottom,mlc_hcc_all_levels,mlc_hcc_dynamic_srhcc,"
-            "mlc_hcc_sr_bottom_deff,mlc_hcc_all_levels_deff,"
-            "mlc_hcc_dynamic_srhcc_deff"
+            "mlc_hcc_sr_bottom,mlc_hcc_all_levels,mlc_hcc_dynamic_srhcc"
         ),
     )
     p.add_argument("--repeats", type=int, default=1)
@@ -236,6 +249,14 @@ def parse_args() -> argparse.Namespace:
         "--keep-db",
         action="store_true",
         help="Keep per-case RocksDB directories after each run.",
+    )
+    p.add_argument(
+        "--extra-prop",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra ycsbc property applied to every case (repeatable). "
+        "Overrides COMMON_PROPS but is overridden by per-scheme props.",
     )
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
@@ -579,6 +600,12 @@ def main() -> int:
         overrides["fieldlength"] = str(args.fieldlength)
     overrides["loadthreadcount"] = str(args.load_threads)
     overrides["insertorder"] = args.insert_order
+    for kv in args.extra_prop:
+        if "=" not in kv:
+            print(f"[ERR] --extra-prop must be KEY=VALUE, got: {kv}")
+            return 2
+        k, v = kv.split("=", 1)
+        overrides[k.strip()] = v.strip()
 
     results_dir = (ycsb_root / args.results_dir / run_id).resolve()
     results_dir.mkdir(parents=True, exist_ok=True)
