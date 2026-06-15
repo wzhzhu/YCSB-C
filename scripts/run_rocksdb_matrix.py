@@ -97,10 +97,12 @@ SCHEMES = {
         "rocksdb.multi_level_cache_dynamic_srhcc_poll_interval_ms": "100",
         "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_enable_threshold": "0.50",
         "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_disable_threshold": "0.30",
-        # Sharded: fixed 6 bits (64 shards) per sub-cache, aligned with the
-        # lru/hcc/arc/cacheus baselines for apples-to-apples comparison (override
-        # uniformly via --shard-bits).
+        # Shard only the bottom level (L6) with the configured bits (6 = 64
+        # shards, aligned with the lru/hcc/arc/cacheus baselines); upper levels
+        # stay unsharded (1 shard). L6 holds the bulk of the data so it gets
+        # sharded concurrency; the small upper levels avoid over-sharding.
         "rocksdb.cache_numshardbits": "6",
+        "rocksdb.multi_level_cache_shard_bottom_only": "true",
     },
     # Bottom level (L6) uses FixedHCC instead of AutoHCC; upper levels stay
     # AutoHCC. AutoHCC degrades on a single large unsharded instance under high
@@ -121,17 +123,20 @@ SCHEMES = {
         "rocksdb.multi_level_cache_allocator_mode": "model",
         "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
         "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
-        # Sharded: fixed 6 bits (64 shards) per sub-cache, aligned with the
-        # baselines and all_levels_sharded (override uniformly via --shard-bits).
+        # Shard only the bottom level (L6) with the configured bits (6, aligned
+        # with the baselines); upper levels unsharded. Same strategy as
+        # all_levels_sharded, applied on top of the L6-FixedHCC arm.
         "rocksdb.cache_numshardbits": "6",
+        "rocksdb.multi_level_cache_shard_bottom_only": "true",
     },
-    # RECOMMENDED MLC config (KNOWN_ISSUES 一.21): keep every level AutoHCC but
-    # shard each sub-cache so the single-instance AutoHCC contention behind the
-    # 4->8GB dip is spread across shards. Shard bits are now fixed at 6 (64
-    # shards/sub-cache), aligned with the lru/hcc/arc/cacheus baselines for
-    # apples-to-apples comparison (was -1=auto, which derived per sub-cache from
-    # the full-budget construction capacity: 6 bits at >=2GB, 5 at 1GB). Override
-    # uniformly via --shard-bits.
+    # RECOMMENDED MLC config (KNOWN_ISSUES 一.21): keep every level AutoHCC and
+    # shard ONLY the bottom level (L6) with the configured shard bits (6 = 64
+    # shards, aligned with the lru/hcc/arc/cacheus baselines); upper levels stay
+    # unsharded (num_shard_bits=0 => 1 shard). L6 holds the bulk of the data
+    # (allocator funds it to ~0.9x total), so it gets sharded concurrency to
+    # spread the single-instance AutoHCC contention behind the 4->8GB dip, while
+    # the small upper levels avoid per-shard fragmentation / over-sharding tiny
+    # budgets. Override the bottom-level bits uniformly via --shard-bits.
     "mlc_hcc_all_levels_sharded": {
         "rocksdb.cache_type": "hyper_clock_cache",
         "rocksdb.use_multi_level_cache": "true",
@@ -143,6 +148,7 @@ SCHEMES = {
         "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
         "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
         "rocksdb.cache_numshardbits": "6",
+        "rocksdb.multi_level_cache_shard_bottom_only": "true",
     },
 }
 

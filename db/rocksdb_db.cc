@@ -286,7 +286,15 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
     if (fixed_entry_charge == 0) {
       fixed_entry_charge = 4096;
     }
-    if (!mixed_srhcc && !mixed_fixed) {
+    // Shard only the bottom level (L_{num_levels-1}) with the configured shard
+    // bits (aligned with the lru/hcc/arc/cacheus baselines); keep every upper
+    // level unsharded (num_shard_bits=0 => 1 shard). The bottom level holds the
+    // bulk of the data (the allocator funds it to ~0.9x of total), so it gets
+    // sharded concurrency, while the small upper levels avoid per-shard
+    // fragmentation/over-sharding. Requires the per-level build path.
+    const bool shard_bottom_only =
+        ParseBool(props, "rocksdb.multi_level_cache_shard_bottom_only", false);
+    if (!mixed_srhcc && !mixed_fixed && !shard_bottom_only) {
       auto cache = std::make_shared<rocksdb::MultiLevelCache>(
           static_cast<size_t>(num_levels), cache_capacity, hcc_opts, force_l0);
       cache->SetSharedPoolRatio(
@@ -323,6 +331,11 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
       }
       if (level >= static_cast<size_t>(srhcc_start_level)) {
         per_level.probation_insert = true;
+      }
+      if (shard_bottom_only) {
+        // Bottom level keeps the script-configured shard bits; others = 0.
+        per_level.num_shard_bits =
+            (level == level_count - 1) ? cache_numshardbits : 0;
       }
       auto sub = per_level.MakeSharedCache();
       sub->SetCapacity(level_capacity);
