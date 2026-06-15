@@ -235,9 +235,10 @@ COMMON_PROPS = {
     "workload": "com.yahoo.ycsb.workloads.CoreWorkload",
     # 100GB with 1024B KV assumption => 104,857,600 records.
     "recordcount": str(100 * 1024 * 1024 * 1024 // 1024),
-    # 20M ops so the transaction phase reaches steady state (1M only measured
-    # the cold-start warm-up transient at these cache sizes).
-    "operationcount": "20000000",
+    # 100M ops so the transaction phase reaches steady state with a long
+    # measurement window (1M only measured the cold-start warm-up transient at
+    # these cache sizes; 20M was tight at the larger caches).
+    "operationcount": "100000000",
     "fieldcount": "10",
     "fieldlength": "100",
     # Approximate 24-byte key with "user" + zero-padded numeric suffix.
