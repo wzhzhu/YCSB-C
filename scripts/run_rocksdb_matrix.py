@@ -97,8 +97,10 @@ SCHEMES = {
         "rocksdb.multi_level_cache_dynamic_srhcc_poll_interval_ms": "100",
         "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_enable_threshold": "0.50",
         "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_disable_threshold": "0.30",
-        # Sharded (auto): combine dynamic SR-HCC with per-sub-cache auto sharding.
-        "rocksdb.cache_numshardbits": "-1",
+        # Sharded: fixed 6 bits (64 shards) per sub-cache, aligned with the
+        # lru/hcc/arc/cacheus baselines for apples-to-apples comparison (override
+        # uniformly via --shard-bits).
+        "rocksdb.cache_numshardbits": "6",
     },
     # Bottom level (L6) uses FixedHCC instead of AutoHCC; upper levels stay
     # AutoHCC. AutoHCC degrades on a single large unsharded instance under high
@@ -119,18 +121,17 @@ SCHEMES = {
         "rocksdb.multi_level_cache_allocator_mode": "model",
         "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
         "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
-        # Sharded (auto): combine the L6-FixedHCC approach with per-sub-cache
-        # auto sharding so it is comparable to all_levels_sharded.
-        "rocksdb.cache_numshardbits": "-1",
+        # Sharded: fixed 6 bits (64 shards) per sub-cache, aligned with the
+        # baselines and all_levels_sharded (override uniformly via --shard-bits).
+        "rocksdb.cache_numshardbits": "6",
     },
     # RECOMMENDED MLC config (KNOWN_ISSUES 一.21): keep every level AutoHCC but
-    # shard each sub-cache (num_shard_bits=-1 = auto, derived per sub-cache from
-    # its full-budget construction capacity) so the single-instance AutoHCC
-    # contention behind the 4->8GB dip is spread across shards. Auto sharding (vs
-    # fixed 6) avoids the small-cache penalty of over-sharding tiny budgets (一.7).
-    # Empirically best on 100GB wlC (single seed): monotonic 739/818/903/1029
-    # KTPS @1/2/4/8GB, beating fixed_bottom at every size and even the global
-    # single hcc s6 (941) at 8GB. fixed_bottom is the secondary/contrast arm.
+    # shard each sub-cache so the single-instance AutoHCC contention behind the
+    # 4->8GB dip is spread across shards. Shard bits are now fixed at 6 (64
+    # shards/sub-cache), aligned with the lru/hcc/arc/cacheus baselines for
+    # apples-to-apples comparison (was -1=auto, which derived per sub-cache from
+    # the full-budget construction capacity: 6 bits at >=2GB, 5 at 1GB). Override
+    # uniformly via --shard-bits.
     "mlc_hcc_all_levels_sharded": {
         "rocksdb.cache_type": "hyper_clock_cache",
         "rocksdb.use_multi_level_cache": "true",
@@ -141,7 +142,7 @@ SCHEMES = {
         "rocksdb.multi_level_cache_allocator_mode": "model",
         "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
         "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
-        "rocksdb.cache_numshardbits": "-1",
+        "rocksdb.cache_numshardbits": "6",
     },
 }
 
