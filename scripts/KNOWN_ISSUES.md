@@ -806,6 +806,21 @@
        arc/cacheus（866/919/963 Kops/s），8GB 794 是已知 MLC 单实例大容量开销、非 c2 引入。
      - **结论 & 落地**：把 `*_tinylfu` 推荐默认改为 `cold_threshold=2, warm_threshold=3`
        （`run_rocksdb_matrix.py` 已生效）。s0/s0c2 路线放弃。
+   - **【BUG 修复，2026-06-15】门卫拒绝路径 `usage_` 记账缺失 —— 之前的 tinylfu
+     结果（含上面 c2 全部数字）偏乐观,需用修复后二进制重测**：
+     - 根因：standalone handle 释放时 FixedHCC/AutoHCC **都会** `usage_.FetchSub`
+       (`clock_cache.cc` 的两处 `IsStandalone()` 分支),但门卫拒绝时只调
+       `StandaloneInsert`(仅加 `standalone_usage_`,不加 `usage_`),而正常 fallback /
+       `CreateStandalone` 都先 `usage_ += charge`。不变量是 `usage_` 必须含 standalone
+       charge(见 `GetUsage()=table_pinned+standalone`、`AddShardEvaluation` 里
+       `GetUsage()-GetStandaloneUsage()`)。
+     - 后果：门卫每拒绝并返回一个块,`usage_` 净减 charge → 持续低估 → 驱逐误判"有
+       空间"→ **表实际占用超过配置容量、命中率被人为抬高**。拒绝越多漂移越大,故 c2
+       的"优势"里掺了"偷用更多内存"的成分,对 lru/arc/cacheus 不公平。
+     - 修复：门卫返回 standalone 前补 `usage_.FetchAddRelaxed(proto.GetTotalCharge())`,
+       与 fallback 一致。已重编 librocksdb.so + 重链 ycsbc,5GB 冒烟通过。
+     - **行动项**：tinylfu-eval / tinylfu-sweep / tinylfu-c2-valid 均在 bug 二进制上
+       跑的,需在修复后二进制上重跑 workload C 全量(wlC-allscheme-fixed-0615)再下结论。
    - **新 prop / 方案**：`rocksdb.hcc_frequency_aware_admission`（B）、
      `rocksdb.hcc_freq_admission_doorkeeper` + `rocksdb.hcc_freq_lookup_sample_log2`（A）、
      `rocksdb.hcc_freq_admission_cold/warm_threshold`；方案 `hcc_freq`/`hcc_tinylfu`、
