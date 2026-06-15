@@ -776,8 +776,36 @@
    - **吞吐**：MLC tinylfu 吞吐反升（8GB 1053 vs base 783，拒冷块省淘汰）；HCC
      tinylfu 8GB −9.5%（采样查找计数代价）。注意 **Cacheus 大缓存吞吐很差**
      （8GB 644 且递减），故 8GB 处 tinylfu **命中追平 Cacheus 而吞吐高 60%+**。
-   - **仍剩**：1GB/2GB 小缓存比 ARC/Cacheus 低 2~3pp；可试 `freq_lookup_sample_log2=0`
-     （每次查找计数，频次更准）或扫 cold 阈值，代价是热路径再多点开销。
+   - **【已补上】小缓存 2~3pp 缺口 —— 靠"更严准入"而非"更细计数"**
+     （tinylfu-sweep-C-seed1-0614，1/2GB 同库扫两杠杆）：
+     - **`_s0`（`freq_lookup_sample_log2=0`，每次查找都计数）是负优化**：mlc
+       1GB .606→**.563**、2GB .647→**.613**，吞吐也降。原因：zipfian 冷尾在窗口内
+       零星重访，全量计数把冷尾频次也抬高 → 门卫放进更多扫描流量 → 抗扫描变弱；
+       且累计更快触发 sketch 减半，长期热信号被冲淡。**所以频次"更准"反而更差。**
+     - **`_c2`（cold≤2 / warm≤3，被看到 ≥3 次才能挤占常驻块）是干净赢家**：
+
+       | 容量 | mlc_base(1/2) | mlc_tinylfu(默认) | **mlc_tinylfu_c2** | ARC | Cacheus |
+       |---|---|---|---|---|---|
+       | 1GB | .566 | .606 | **.642** | .628 | .639 |
+       | 2GB | .612 | .647 | **.679** | .665 | .670 |
+
+       c2 相比默认 +3.6pp/+3.3pp，**双双反超 ARC、追平/超过 Cacheus**（2GB .679 >
+       Cacheus .670），且吞吐全表最高（847/950 Kops/s，命中高→回盘少）。
+     - **全容量复核（tinylfu-c2-valid-C-seed1-0615，1/2/4/8GB 同库）—— c2 是全局
+       净提升，大缓存非但无回退反而更高：**
+
+       | 容量 | LRU | ARC | Cacheus | hcc_tinylfu(c2) | mlc_tinylfu(c2) |
+       |---|---|---|---|---|---|
+       | 1GB | .584 | .644 | .648 | .630 | **.646** |
+       | 2GB | .635 | .673 | .678 | .674 | **.685** |
+       | 4GB | .683 | .705 | .708 | **.713** | **.717** |
+       | 8GB | .729 | .737 | .737 | **.743** | **.741** |
+
+       mlc c2 在 2/4/8GB **全面反超 ARC 与 Cacheus**，1GB 平 Cacheus、超 ARC；相比旧
+       默认(sample1/cold1：.608/.649/.690/.727)每档 +1.4~3.8pp。吞吐 1/2/4GB 也高于
+       arc/cacheus（866/919/963 Kops/s），8GB 794 是已知 MLC 单实例大容量开销、非 c2 引入。
+     - **结论 & 落地**：把 `*_tinylfu` 推荐默认改为 `cold_threshold=2, warm_threshold=3`
+       （`run_rocksdb_matrix.py` 已生效）。s0/s0c2 路线放弃。
    - **新 prop / 方案**：`rocksdb.hcc_frequency_aware_admission`（B）、
      `rocksdb.hcc_freq_admission_doorkeeper` + `rocksdb.hcc_freq_lookup_sample_log2`（A）、
      `rocksdb.hcc_freq_admission_cold/warm_threshold`；方案 `hcc_freq`/`hcc_tinylfu`、

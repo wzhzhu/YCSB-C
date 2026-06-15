@@ -201,15 +201,27 @@ SCHEMES["mlc_hcc_all_levels_sharded_freq_strict"] = {
 # scan-resistant admission that drives arc/cacheus-level hit ratios, while
 # keeping HCC lock-free (sketch is relaxed-atomic; rejection reuses the existing
 # standalone path). *_tinylfu variants enable it.
+# Recommended W-TinyLFU config: doorkeeper on, 1-in-2 lookup sampling, and the
+# stricter cold<=2 / warm<=3 admission thresholds. The small-cache sweep
+# (tinylfu-sweep-C-seed1-0614) showed this combo closes the residual 2-3pp gap
+# to arc/cacheus at 1-2GB (mlc: 0.642@1GB / 0.679@2GB, beating arc and matching
+# cacheus) with the highest throughput, while the alternative "count every
+# lookup" lever (sample_log2=0) was a net negative -- it inflates the cold-tail
+# frequency so the doorkeeper admits more scan traffic, dropping hit ratio AND
+# throughput. So the win comes from stricter admission, not finer counting.
 SCHEMES["hcc_tinylfu"] = {
     **SCHEMES["hcc_freq"],
     "rocksdb.hcc_freq_admission_doorkeeper": "true",
     "rocksdb.hcc_freq_lookup_sample_log2": "1",
+    "rocksdb.hcc_freq_admission_cold_threshold": "2",
+    "rocksdb.hcc_freq_admission_warm_threshold": "3",
 }
 SCHEMES["mlc_hcc_all_levels_sharded_tinylfu"] = {
     **SCHEMES["mlc_hcc_all_levels_sharded_freq"],
     "rocksdb.hcc_freq_admission_doorkeeper": "true",
     "rocksdb.hcc_freq_lookup_sample_log2": "1",
+    "rocksdb.hcc_freq_admission_cold_threshold": "2",
+    "rocksdb.hcc_freq_admission_warm_threshold": "3",
 }
 
 COMMON_PROPS = {
