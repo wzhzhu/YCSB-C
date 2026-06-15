@@ -356,9 +356,19 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--refill-policy",
-        choices=["per_case", "reuse_if_readonly"],
+        choices=["per_case", "reuse_if_readonly", "clone_per_case"],
         default="per_case",
-        help="per_case: refill each case; reuse_if_readonly: reuse DB for readonly workloads.",
+        help="per_case: refill each case; reuse_if_readonly: reuse one DB for "
+        "readonly workloads; clone_per_case: fill a clean golden snapshot once "
+        "per data-config, then clone (hardlink SSTs) it per case so write "
+        "workloads start from an identical, uncontaminated state without "
+        "reloading. Recommended for write workloads (A/B/D/E/F).",
+    )
+    p.add_argument(
+        "--golden-fill-scheme",
+        default="lru",
+        help="Cache scheme used only for the one-time golden load (on-disk data "
+        "is scheme-independent). Default lru.",
     )
     p.add_argument(
         "--keep-db",
@@ -422,6 +432,144 @@ def remove_tree_with_retry(path: pathlib.Path, retries: int = 5, delay_s: float 
             if attempt + 1 >= retries:
                 raise
             time.sleep(delay_s)
+
+
+# Properties that determine the on-disk loaded data (and therefore which golden
+# snapshot a case can clone from). The transaction-phase knobs (proportions,
+# requestdistribution, cache scheme, threads, ...) do NOT affect the loaded
+# bytes, so every workload that shares these values shares one golden fill.
+LOAD_SIG_KEYS = (
+    "recordcount",
+    "insertorder",
+    "fieldcount",
+    "fieldlength",
+    "zeropadding",
+    "field_len_dist",
+    "rocksdb.raw_kv_mode",
+    "rocksdb.raw_key_size_bytes",
+    "rocksdb.raw_value_size_bytes",
+    "rocksdb.target_file_size_base",
+    "rocksdb.write_buffer_size",
+    "rocksdb.bloom_bits_per_key",
+)
+
+# Immutable data files RocksDB never rewrites in place -> safe to hardlink when
+# cloning. Everything else (MANIFEST/CURRENT/OPTIONS/IDENTITY/LOG*/WAL/LOCK) is
+# small and gets a real copy so the golden is never mutated by a clone's run.
+CLONE_HARDLINK_SUFFIXES = (".sst", ".blob")
+
+
+def data_signature(load_props: Dict[str, str]) -> str:
+    import hashlib
+
+    payload = "|".join(f"{k}={load_props.get(k, '')}" for k in LOAD_SIG_KEYS)
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:10]
+
+
+def golden_is_valid(golden_dir: pathlib.Path) -> bool:
+    """A valid RocksDB snapshot has CURRENT plus data either flushed to SST or
+    still recoverable from a non-empty WAL (.log). Large loads flush to SST (WAL
+    ~empty); small loads may keep everything in the WAL -- both open correctly
+    with skipload because RocksDB replays the WAL on open."""
+    if not (golden_dir.is_dir() and (golden_dir / "CURRENT").exists()):
+        return False
+    has_sst = False
+    has_wal = False
+    for p in golden_dir.iterdir():
+        if p.suffix == ".sst":
+            has_sst = True
+            break
+        if p.suffix == ".log" and p.stat().st_size > 0:
+            has_wal = True
+    return has_sst or has_wal
+
+
+def clone_db(src: pathlib.Path, dst: pathlib.Path) -> Tuple[int, int]:
+    """Checkpoint-style clone: hardlink immutable SST/blob files, real-copy the
+    rest. Near-instant and zero extra space for the bulk data, while keeping the
+    golden untouched (RocksDB only adds/removes whole SST files and appends to
+    the small metadata files, which are private copies here). Returns
+    (hardlinked, copied) file counts."""
+    if dst.exists():
+        remove_tree_with_retry(dst)
+    hardlinked = 0
+    copied = 0
+    for root, dirs, files in os.walk(src):
+        rel = pathlib.Path(root).relative_to(src)
+        (dst / rel).mkdir(parents=True, exist_ok=True)
+        for name in files:
+            s = pathlib.Path(root) / name
+            d = dst / rel / name
+            if name.endswith(CLONE_HARDLINK_SUFFIXES):
+                try:
+                    os.link(s, d)
+                    hardlinked += 1
+                    continue
+                except OSError:
+                    pass  # cross-device or unsupported -> fall back to copy
+            shutil.copy2(s, d)
+            copied += 1
+    return hardlinked, copied
+
+
+def fill_golden(
+    ycsb_root: pathlib.Path,
+    golden_dir: pathlib.Path,
+    base_spec: Dict[str, str],
+    overrides: Dict[str, str],
+    fill_scheme: str,
+    log_dir: pathlib.Path,
+    sig: str,
+) -> bool:
+    """Create a clean, fully-compacted golden snapshot by running the load phase
+    only (operationcount=0 => zero transactions => no write pollution).
+    wait_for_compact_before_transactions makes the snapshot fully compacted."""
+    props = dict(base_spec)
+    props.update(COMMON_PROPS)
+    props.update(overrides)
+    props.update(SCHEMES[fill_scheme])
+    props["operationcount"] = "0"
+    props["skipload"] = "false"
+    props["rocksdb.dir"] = str(golden_dir)
+    golden_dir.parent.mkdir(parents=True, exist_ok=True)
+    if golden_dir.exists():
+        remove_tree_with_retry(golden_dir)
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    spec_path = log_dir / f"golden-{sig}.spec"
+    write_props(spec_path, props)
+    # Load uses loadthreadcount; the transaction phase runs 0 ops so 1 thread is
+    # enough (avoids spawning a swarm of idle transaction threads).
+    cmd = [
+        str(ycsb_root / "ycsbc"),
+        "-db",
+        "rocksdb",
+        "-threads",
+        "1",
+        "-P",
+        str(spec_path),
+    ]
+    print(f"[INFO] filling golden {golden_dir} (sig={sig}, load-only)", flush=True)
+    proc = subprocess.run(
+        cmd, cwd=str(ycsb_root), text=True, capture_output=True, check=False
+    )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    (log_dir / f"golden-{sig}.log").write_text(output, encoding="utf-8")
+    ok = proc.returncode == 0 and golden_is_valid(golden_dir)
+    if ok:
+        # Record the data signature so a later reuse can detect a mismatch.
+        meta = {k: str({**COMMON_PROPS, **overrides}.get(k, "")) for k in LOAD_SIG_KEYS}
+        meta_lines = [f"sig={sig}"] + [f"{k}={v}" for k, v in meta.items()]
+        (golden_dir / "golden.meta").write_text(
+            "\n".join(meta_lines) + "\n", encoding="utf-8"
+        )
+    else:
+        print(
+            f"[ERR] golden fill failed (exit={proc.returncode}); see "
+            f"{log_dir / f'golden-{sig}.log'}",
+            file=sys.stderr,
+        )
+    return ok
 
 
 def parse_metrics(output: str) -> Dict[str, float]:
@@ -500,6 +648,7 @@ def run_once(
     clean_db_before_run: bool,
     cleanup_after_run: bool,
     keep_db: bool,
+    clone_from: pathlib.Path = None,
 ) -> Dict[str, str]:
     base_spec = load_spec(ycsb_root / WORKLOAD_SPECS[workload])
     props = dict(base_spec)
@@ -513,7 +662,17 @@ def run_once(
     db_dir = db_root_dir / db_run_id / db_subdir
     props["rocksdb.dir"] = str(db_dir)
     db_dir.parent.mkdir(parents=True, exist_ok=True)
-    if clean_db_before_run and db_dir.exists():
+    if clone_from is not None:
+        # Materialize a private, identical starting state from the golden so the
+        # transaction phase's writes never touch the shared snapshot.
+        t0 = time.time()
+        hl, cp = clone_db(clone_from, db_dir)
+        print(
+            f"[INFO] cloned golden -> {db_dir} "
+            f"({hl} hardlinked sst/blob, {cp} copied, {time.time() - t0:.1f}s)",
+            flush=True,
+        )
+    elif clean_db_before_run and db_dir.exists():
         remove_tree_with_retry(db_dir)
 
     spec_dir = results_dir / "specs"
@@ -786,6 +945,10 @@ def main() -> int:
     }
     shared_loaded_workloads: set = set()
     shared_db_subdirs: Dict[str, str] = {}
+    # clone_per_case: one golden snapshot per data-signature, shared across all
+    # workloads that load identical data.
+    golden_paths: Dict[str, pathlib.Path] = {}
+    load_props_global = {**COMMON_PROPS, **overrides}
 
     rows: List[Dict[str, str]] = []
     for idx, (wl, scheme, cache_bytes, t, sb, r) in enumerate(matrix, start=1):
@@ -794,10 +957,44 @@ def main() -> int:
             f"cache={cache_bytes} threads={t} shard_bits={sb} repeat={r}",
             flush=True,
         )
+        clone_from = None
         reuse_db = (
             args.refill_policy == "reuse_if_readonly" and readonly_workloads.get(wl, False)
         )
-        if reuse_db:
+        if args.refill_policy == "clone_per_case":
+            sig = data_signature(load_props_global)
+            golden_dir = db_root_dir / db_run_id / "golden" / f"data-{sig}"
+            if sig not in golden_paths:
+                have_golden = golden_is_valid(golden_dir)
+                if have_golden and args.reuse_existing_db:
+                    print(
+                        f"[INFO] reusing existing golden {golden_dir} (sig={sig})",
+                        flush=True,
+                    )
+                elif have_golden and not args.reuse_existing_db:
+                    print(
+                        f"[INFO] golden already present at {golden_dir} (sig={sig}); "
+                        "reusing (pass nothing to refill; delete it to force)",
+                        flush=True,
+                    )
+                else:
+                    if not fill_golden(
+                        ycsb_root,
+                        golden_dir,
+                        base_workload_props[wl],
+                        overrides,
+                        args.golden_fill_scheme,
+                        results_dir / "logs",
+                        sig,
+                    ):
+                        return 3
+                golden_paths[sig] = golden_dir
+            clone_from = golden_paths[sig]
+            db_subdir = f"wl{wl}-{scheme}-c{cache_bytes}-t{t}-s{sb}-r{r}"
+            skip_load = True
+            clean_db_before_run = False
+            cleanup_after_run = True
+        elif reuse_db:
             db_subdir = shared_db_subdirs.get(wl, f"shared/wl{wl}")
             shared_db_subdirs[wl] = db_subdir
             already_loaded = wl in shared_loaded_workloads
@@ -843,6 +1040,7 @@ def main() -> int:
             clean_db_before_run,
             cleanup_after_run,
             args.keep_db,
+            clone_from,
         )
         rows.append(row)
         if reuse_db and row["exit_code"] == "0":
