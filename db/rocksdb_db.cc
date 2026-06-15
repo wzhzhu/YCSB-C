@@ -256,7 +256,27 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
         ParseInt(props, "rocksdb.multi_level_cache_srhcc_start_level", -1);
     const bool mixed_srhcc = srhcc_start_level >= 0 &&
                              srhcc_start_level < num_levels;
-    if (!mixed_srhcc) {
+    // FixedHCC for bottom (hot) levels. AutoHCC degrades on a single large
+    // unsharded instance under high concurrency (the "4->8GB throughput dip",
+    // KNOWN_ISSUES 一.21); FixedHCC's flat preallocated table does not (global
+    // FixedHCC s0: 947->999 monotonic vs AutoHCC s0 895->677). But FixedHCC
+    // tables cannot grow, and MLC sizes every sub-cache table for the full
+    // budget (needed for AutoHCC's mmap reservation). A FixedHCC table used at
+    // a small per-level fraction is then pathologically sparse -> Evict() sweeps
+    // O(table) empty slots per victim -> 64 threads spin (measured ~16x slower).
+    // So apply FixedHCC only to bottom levels the allocator keeps near the full
+    // budget (L6 -> ~0.88x total, dense enough); upper levels stay AutoHCC,
+    // which tolerates sparsity (lazy mmap). Requires the per-level build path.
+    const int fixed_start_level =
+        ParseInt(props, "rocksdb.multi_level_cache_fixed_start_level", -1);
+    const bool mixed_fixed = fixed_start_level >= 0 &&
+                             fixed_start_level < num_levels;
+    size_t fixed_entry_charge = ParseUint64(
+        props, "rocksdb.multi_level_cache_fixed_entry_charge", 4096);
+    if (fixed_entry_charge == 0) {
+      fixed_entry_charge = 4096;
+    }
+    if (!mixed_srhcc && !mixed_fixed) {
       auto cache = std::make_shared<rocksdb::MultiLevelCache>(
           static_cast<size_t>(num_levels), cache_capacity, hcc_opts, force_l0);
       cache->SetSharedPoolRatio(
@@ -284,6 +304,13 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
       // smaller starting capacity afterward. Sizing the mmap at level_capacity
       // here let Grow() run past the mapping and corrupt the heap.
       per_level.capacity = std::max<size_t>(1, cache_capacity);
+      // Bottom levels -> FixedHCC (estimated_entry_charge > 0); others keep the
+      // base charge (0 => AutoHCC). Table is sized from per_level.capacity (full
+      // budget) via CalcHashBits, so a level the allocator funds near full stays
+      // dense.
+      if (mixed_fixed && level >= static_cast<size_t>(fixed_start_level)) {
+        per_level.estimated_entry_charge = fixed_entry_charge;
+      }
       if (level >= static_cast<size_t>(srhcc_start_level)) {
         per_level.probation_insert = true;
       }

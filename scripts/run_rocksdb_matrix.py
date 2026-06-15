@@ -76,7 +76,7 @@ SCHEMES = {
         "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
         "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
     },
-    "mlc_hcc_dynamic_srhcc": {
+    "mlc_hcc_dynamic_srhcc_sharded": {
         "rocksdb.cache_type": "hyper_clock_cache",
         "rocksdb.use_multi_level_cache": "true",
         "rocksdb.num_levels": "7",
@@ -97,13 +97,58 @@ SCHEMES = {
         "rocksdb.multi_level_cache_dynamic_srhcc_poll_interval_ms": "100",
         "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_enable_threshold": "0.50",
         "rocksdb.multi_level_cache_dynamic_srhcc_unique_ratio_disable_threshold": "0.30",
+        # Sharded (auto): combine dynamic SR-HCC with per-sub-cache auto sharding.
+        "rocksdb.cache_numshardbits": "-1",
+    },
+    # Bottom level (L6) uses FixedHCC instead of AutoHCC; upper levels stay
+    # AutoHCC. AutoHCC degrades on a single large unsharded instance under high
+    # concurrency (the 4->8GB throughput dip, KNOWN_ISSUES 一.21); FixedHCC's
+    # flat preallocated table does not. FixedHCC is applied only to L6 (which the
+    # allocator keeps near the full budget, so its full-budget-sized table stays
+    # dense); upper levels keep AutoHCC because a FixedHCC table used at a small
+    # per-level fraction is pathologically sparse.
+    "mlc_hcc_fixed_bottom_sharded": {
+        "rocksdb.cache_type": "hyper_clock_cache",
+        "rocksdb.use_multi_level_cache": "true",
+        "rocksdb.num_levels": "7",
+        "rocksdb.multi_level_cache_srhcc_start_level": "-1",
+        "rocksdb.multi_level_cache_fixed_start_level": "6",
+        "rocksdb.multi_level_cache_fixed_entry_charge": "4096",
+        "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
+        "rocksdb.multi_level_cache_auto_adjust": "true",
+        "rocksdb.multi_level_cache_allocator_mode": "model",
+        "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
+        "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
+        # Sharded (auto): combine the L6-FixedHCC approach with per-sub-cache
+        # auto sharding so it is comparable to all_levels_sharded.
+        "rocksdb.cache_numshardbits": "-1",
+    },
+    # RECOMMENDED MLC config (KNOWN_ISSUES 一.21): keep every level AutoHCC but
+    # shard each sub-cache (num_shard_bits=-1 = auto, derived per sub-cache from
+    # its full-budget construction capacity) so the single-instance AutoHCC
+    # contention behind the 4->8GB dip is spread across shards. Auto sharding (vs
+    # fixed 6) avoids the small-cache penalty of over-sharding tiny budgets (一.7).
+    # Empirically best on 100GB wlC (single seed): monotonic 739/818/903/1029
+    # KTPS @1/2/4/8GB, beating fixed_bottom at every size and even the global
+    # single hcc s6 (941) at 8GB. fixed_bottom is the secondary/contrast arm.
+    "mlc_hcc_all_levels_sharded": {
+        "rocksdb.cache_type": "hyper_clock_cache",
+        "rocksdb.use_multi_level_cache": "true",
+        "rocksdb.num_levels": "7",
+        "rocksdb.multi_level_cache_srhcc_start_level": "-1",
+        "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
+        "rocksdb.multi_level_cache_auto_adjust": "true",
+        "rocksdb.multi_level_cache_allocator_mode": "model",
+        "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
+        "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
+        "rocksdb.cache_numshardbits": "-1",
     },
 }
 
 # D_eff variants: same as the base MLC schemes but the allocator models each
 # level with its effective working-set estimate D_eff = -(alpha*c)/ln(1-hit)
 # instead of the raw level data size (ported from db_bench).
-for _base in ("mlc_hcc_sr_bottom", "mlc_hcc_all_levels", "mlc_hcc_dynamic_srhcc"):
+for _base in ("mlc_hcc_sr_bottom", "mlc_hcc_all_levels", "mlc_hcc_dynamic_srhcc_sharded"):
     SCHEMES[f"{_base}_deff"] = {
         **SCHEMES[_base],
         "rocksdb.multi_level_cache_use_effective_data_size": "true",
@@ -112,7 +157,7 @@ for _base in ("mlc_hcc_sr_bottom", "mlc_hcc_all_levels", "mlc_hcc_dynamic_srhcc"
 # No-cap variants: disable the data-size capacity cap (cap_at_data_size) so the
 # allocator may over-allocate hot-but-small levels. Used for controlled A/B
 # against the default (cap-on) base schemes to isolate the cap's contribution.
-for _base in ("mlc_hcc_sr_bottom", "mlc_hcc_all_levels", "mlc_hcc_dynamic_srhcc"):
+for _base in ("mlc_hcc_sr_bottom", "mlc_hcc_all_levels", "mlc_hcc_dynamic_srhcc_sharded"):
     SCHEMES[f"{_base}_nocap"] = {
         **SCHEMES[_base],
         "rocksdb.multi_level_cache_cap_at_data_size": "false",
@@ -210,7 +255,8 @@ def parse_args() -> argparse.Namespace:
         # SCHEMES so they can still be selected explicitly via --schemes.
         default=(
             "lru,hcc,arc,cacheus,"
-            "mlc_hcc_sr_bottom,mlc_hcc_all_levels,mlc_hcc_dynamic_srhcc"
+            "mlc_hcc_all_levels,mlc_hcc_fixed_bottom_sharded,"
+            "mlc_hcc_dynamic_srhcc_sharded,mlc_hcc_all_levels_sharded"
         ),
     )
     p.add_argument("--repeats", type=int, default=1)

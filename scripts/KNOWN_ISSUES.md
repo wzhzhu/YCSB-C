@@ -462,6 +462,94 @@
       730–857,命中率相当 ~0.71–0.72）——诚实"代价"结论,与一.14 及 MLC 主场定位
       （异质/ISO,见五.5）一致。
 
+21. **【已定位根因】残留"命中升、吞吐降"（4→8GB）= 单个未分片 AutoHCC 实例在
+    高并发 + 大容量下的争用,与 MLC routing/allocator/估计器无关；治本 = 分片,
+    probation 只是治标**
+    - **背景**：一.20 用 WFC 消除了 compaction 污染导致的"灾难级 inversion"后,
+      `all_levels`/`dynamic_srhcc` 在 100GB 仍残留一个温和凹陷（8GB 略低于 4GB,
+      命中率却更高）,而 `sr_bottom` 单调。最初怀疑是单种子噪声或 allocator 残留缺陷。
+    - **决定性隔离实验（hcc-shard-probe-0614,100GB,同一共享 DB,只变分片度）**：
+      把 MLC 完全拿掉,直接测**全局单层 HCC** 在分片 vs 不分片下的标度：
+
+      | scheme | shard | 4GB | 8GB | 趋势 |
+      |---|---|---:|---:|---|
+      | hcc **s0（1 shard,未分片）** | 1 | 895 | **677** | **凹陷 −24%** |
+      | hcc s6（64 shard） | 64 | 920 | 941 | 单调 ✅ |
+
+      命中率两档几乎相同（~0.674）。即**未分片的普通单层 HCC 自己就复现了凹陷**,
+      与 MLC 毫无关系。
+    - **根因**：单个 AutoHCC 实例虽"无全局锁",但其 **clock 指针推进、淘汰回收、
+      表扩容协调** 在 64 线程并发下仍是集中争用点；容量越大（8GB→单实例管 ~7.6GB
+      条目）争用开销越高,超过更高命中率省下的 I/O（且快 NVMe + 64 线程下 miss 的
+      磁盘 I/O 被并发隐藏,几乎"免费",而 hit 全压在单实例上）→ 吞吐反降。RocksDB
+      默认给全局 HCC 上 64 分片（s6）正是为此。
+    - **映射到 MLC**：MLC 在 `COMMON_PROPS` 强制 `cache_numshardbits=0`,**每个子缓存
+      只有 1 shard**；承载 ~89% lookup 的热层 L6 因此单 shard 化,得到与 hcc s0 完全
+      一致的凹陷（all_levels 818→730）。`sr_bottom` 的 L6 开 `probation_insert=true`
+      （SR-HCC,插入 countdown=0,淘汰回收近 O(1)）削减了单实例的淘汰争用,所以单调
+      817→857——**这是治标,不是 allocator 修好了**。
+      | | 4GB | 8GB | |
+      |---|---:|---:|---|
+      | MLC all_levels s0 | 818 | 730 | 凹陷（L6 单 shard,同病） |
+      | MLC sr_bottom s0（probation） | 817 | 857 | 治标 |
+      | hcc s6（分片） | 920 | 941 | 治本 |
+    - **更正先前判断**：一.20 残留观察里"疑单种子噪声"被否定（s0 凹陷稳定可复现）；
+      "HCC 无锁、分片影响不大"的旧假设也要修正——单实例 AutoHCC 在此并发/容量下分片
+      收益显著（s0 677 vs s6 941 @8GB,+39%）。
+    - **更深一层：根因是 AutoHCC 特有,不是泛化的"单实例未分片"（FixedHCC 实验,同 DB）**：
+      把全局 HCC 从 Auto 换成 **Fixed**（`estimated_entry_charge=4096`）后,**即使不分片
+      也单调且最快**：
+
+      | 全局单层 HCC | shard | 4GB | 8GB | 趋势 |
+      |---|---|---:|---:|---|
+      | AutoHCC s0 | 1 | 895 | 677 | 凹陷 −24% |
+      | AutoHCC s6 | 64 | 920 | 941 | 单调 |
+      | **FixedHCC s0** | 1 | **947** | **999** | **单调,最快** |
+
+      ⇒ 凹陷源于 **AutoHCC 的动态增长 + 链式表结构**在单实例大容量并发下退化；FixedHCC
+      的扁平预分配开放寻址表无此问题。分片只是把退化摊薄（治标的另一形态）。
+    - **FixedHCC 不能整体塞进 MLC（已实测 + 代码坐实）**：MLC 为 AutoHCC 的 mmap 增长把
+      **每个子缓存表都按 `total_capacity` 建**（`multi_level_cache.cc:MakeSubCacheWithCapacity`）。
+      FixedHCC 表构造时定死、`SetCapacity` 只调阈值,于是被 allocator 只分到一小块容量的
+      层 → 表**极度稀疏**；FixedHCC `Evict()`（`clock_cache.cc:1161`）逐槽扫描、空槽也扫,
+      上限 `3×整表槽数` → 每淘汰一块要扫几十空槽 → 64 线程在淘汰扫描里**自旋,实测慢 ~16×**。
+      （全局单实例 FixedHCC 没事,因表≈容量、密集。）
+    - **【已实现 + 已验证】修复 = 仅热层 L6 用 FixedHCC,上层留 AutoHCC**（方案
+      `mlc_hcc_fixed_bottom`,prop `multi_level_cache_fixed_start_level=6`）：L6 被 allocator
+      喂到 ~0.83–0.9×total,其"按 full 建"的 FixedHCC 表密集（load factor ~0.3,快）;
+      上层 L0–L5 留 AutoHCC,天然容忍稀疏（惰性 mmap）。同一 100GB DB 实测：
+
+      | MLC all_levels 变体 | 4GB | 8GB | 趋势 |
+      |---|---:|---:|---|
+      | AutoHCC s0（原默认） | 838 | 773 | 凹陷 −8% |
+      | FixedHCC 全层 | 自旋 | 自旋 | 病态(已弃) |
+      | **FixedHCC 仅 L6** | 862 | **891** | **单调 +3%；8GB 比 AutoHCC +15%** |
+
+      也优于 `sr_bottom` 的 probation 治标（857@8GB）。
+      实现：`rocksdb_db.cc` 的 per-level 构造路径在 `mixed_srhcc || mixed_fixed` 时启用,
+      对 `level >= fixed_start_level` 设 `per_level.estimated_entry_charge = fixed_entry_charge`
+      （→ FixedHCC）,其余保持 base 的 0（→ AutoHCC）。
+    - **【最优方案，已验证】方向 1：每层仍 AutoHCC 但分片（`cache_numshardbits=-1` auto），
+      反而全面优于 fixed_bottom**（方案 `mlc_hcc_all_levels_sharded`）。同一 100GB DB 全曲线：
+
+      | MLC all_levels 变体 | 1GB | 2GB | 4GB | 8GB | 趋势 |
+      |---|---:|---:|---:|---:|---|
+      | AutoHCC s0（原默认） | 741 | 797 | 838 | 773 | 凹陷 |
+      | FixedBottom（方向2，仅 L6 Fixed） | 740 | 815 | 862 | 891 | 单调 |
+      | **AutoHCC auto-shard（方向1）** | 739 | 818 | 903 | **1029** | **单调,全程最快** |
+
+      参照：全局单 cache hcc s6 @8GB = 941。**auto-shard 的 MLC @8GB 1029 反超全局单
+      cache（+9%）**,且比 fixed_bottom +15%；1GB 739≈其他（**无小缓存退化**——`auto(-1)`
+      按容量自适应分片数,小预算不会被切成 64 片,规避了一.7 的惩罚）。
+      - **为何方向1 > 方向2**：分片作用于**所有层**(含 L6),把 AutoHCC 单实例争用全面摊开,
+        且 auto 自适应分片数；fixed_bottom 只修 L6、上层仍未分片 AutoHCC,且 L6 FixedHCC 仍单实例。
+      - **更正最初取舍**：当初选方向2 是因为(a)以为分片伤小缓存、(b)全局 FixedHCC 看着最快。
+        但 `auto` 分片解决了(a),而 MLC 分层场景下全面分片(方向1)赢过仅底层 FixedHCC(方向2)。
+      - **推荐配置 = `mlc_hcc_all_levels_sharded`（AutoHCC + auto 分片）**。fixed_bottom 作为
+        次优/对照保留。两者均在 matrix 默认 `--schemes`。**单种子结论,待 100GB 全量多种子复核。**
+    - **待办**：100GB 全量重跑（默认 schemes 已含 `all_levels`/`fixed_bottom`/`all_levels_sharded`）
+      做正式对照 + 多种子定性,确认 auto-shard 推荐稳健。
+
 ## 二、Wrapper（ARC/Cacheus）分片设计的边界点
 
 实现：`cache/sharded_wrapper_cache.*`、`cache/wrapper_cache_shard.h`，
