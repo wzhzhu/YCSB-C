@@ -163,6 +163,55 @@ for _base in ("mlc_hcc_sr_bottom", "mlc_hcc_all_levels", "mlc_hcc_dynamic_srhcc_
         "rocksdb.multi_level_cache_cap_at_data_size": "false",
     }
 
+# Frequency-aware admission (plan B): each HCC shard keeps a small lock-free
+# Count-Min sketch updated on insert (the miss path only, so the lock-free
+# Lookup hot path is untouched). A new data block's initial CLOCK countdown is
+# chosen from its recent insert frequency: one-hit-wonders enter on probation
+# (ARC/TinyLFU-style scan resistance) and die on the next sweep, while the hot
+# reuse set earns full residency. Goal: push HCC/MLC hit ratio past LRU toward
+# arc/cacheus without giving up HCC's lock-freedom. *_freq variants enable it.
+SCHEMES["hcc_freq"] = {
+    **SCHEMES["hcc"],
+    "rocksdb.hcc_frequency_aware_admission": "true",
+}
+for _base in ("mlc_hcc_all_levels", "mlc_hcc_all_levels_sharded"):
+    SCHEMES[f"{_base}_freq"] = {
+        **SCHEMES[_base],
+        "rocksdb.hcc_frequency_aware_admission": "true",
+    }
+# Stricter thresholds (cold<=2 -> probation, warm==3 -> countdown 1): a key must
+# be (re-)fetched >=4 times to earn full residency. More aggressive scan/cold-
+# tail resistance for the *_strict sweep arm.
+SCHEMES["hcc_freq_strict"] = {
+    **SCHEMES["hcc_freq"],
+    "rocksdb.hcc_freq_admission_cold_threshold": "2",
+    "rocksdb.hcc_freq_admission_warm_threshold": "3",
+}
+SCHEMES["mlc_hcc_all_levels_sharded_freq_strict"] = {
+    **SCHEMES["mlc_hcc_all_levels_sharded_freq"],
+    "rocksdb.hcc_freq_admission_cold_threshold": "2",
+    "rocksdb.hcc_freq_admission_warm_threshold": "3",
+}
+
+# Plan A -- W-TinyLFU doorkeeper. Builds on *_freq by (1) also counting lookups
+# (sampled, 1-in-2) into the sketch so it reflects true access frequency (hits
+# included), and (2) refusing admission to a cold newcomer (freq <= cold
+# threshold) whenever its shard is already full, returning it as a standalone
+# (uncached) handle instead of evicting a warmer resident entry. This is the
+# scan-resistant admission that drives arc/cacheus-level hit ratios, while
+# keeping HCC lock-free (sketch is relaxed-atomic; rejection reuses the existing
+# standalone path). *_tinylfu variants enable it.
+SCHEMES["hcc_tinylfu"] = {
+    **SCHEMES["hcc_freq"],
+    "rocksdb.hcc_freq_admission_doorkeeper": "true",
+    "rocksdb.hcc_freq_lookup_sample_log2": "1",
+}
+SCHEMES["mlc_hcc_all_levels_sharded_tinylfu"] = {
+    **SCHEMES["mlc_hcc_all_levels_sharded_freq"],
+    "rocksdb.hcc_freq_admission_doorkeeper": "true",
+    "rocksdb.hcc_freq_lookup_sample_log2": "1",
+}
+
 COMMON_PROPS = {
     "workload": "com.yahoo.ycsb.workloads.CoreWorkload",
     # 100GB with 1024B KV assumption => 104,857,600 records.

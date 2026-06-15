@@ -740,3 +740,47 @@
      （尤其 `multi_level_cache_allocator.h` 的 struct/类布局），**必须连带重编
      `ycsbc`**（`make` 不追踪头依赖，需 `touch db/rocksdb_db.cc` 或 `make clean`）。
      否则任何 sizeof 变化都会以"随机堆损坏"形式爆雷，极易误导为缓存并发 bug。
+
+7. **【兑现 五.4 预言】无锁频次准入（W-TinyLFU on CLOCK）让 HCC/MLC 命中率越过
+   LRU、在大缓存追平 ARC/Cacheus**（2026-06-14）
+   - 五.4 曾断言："真正能补 ARC 差距的唯一无锁杠杆是给子缓存加无锁幽灵/准入
+     过滤"。本节即实现并验证之，且**不牺牲 HCC 的无锁特性**。
+   - **实现**（`cache/clock_cache.{h,cc}` + `include/rocksdb/cache.h`）：
+     - `FrequencySketch`：每 shard 一个无锁 Count-Min sketch（4 行 × w 字节，
+       全 relaxed 原子，竞争只丢计数；按 `width×10` 累计触发单线程减半 aging）。
+       仅在开启时分配，索引直接取 `hashed_key[0/1]` 高低 32 位。
+     - **方案 B（`frequency_aware_admission`，弱）**：只在 insert(miss) 计数，按
+       频次选新块初始 CLOCK countdown（冷→0/温→1/热→2）。**Lookup 热路径零改动**。
+     - **方案 A（`freq_admission_doorkeeper`，强）**：在 B 之上 (1) 采样(默认 1/2)
+       在 Lookup 也计数，使 sketch 反映含命中的真实频率；(2) **容量受压时拒绝
+       冷 newcomer**（freq≤cold 阈值且 `usage+charge>capacity`）——走已有 standalone
+       路径返回数据但不入表，冷块不再挤掉常驻热块。拒绝走 standalone、sketch 全
+       relaxed，**仍是无锁**。
+   - **结果（tinylfu-eval-C-seed1-0614，wlC 100GB，t64，seed1，同库）hit_ratio：**
+
+     | 容量 | LRU | hcc | hcc_tinylfu | ARC | Cacheus | mlc_base | mlc_tinylfu |
+     |---|---|---|---|---|---|---|---|
+     | 1GB | .582 | .581 | **.596** | .635 | .640 | .566 | **.608** |
+     | 2GB | .627 | .628 | **.643** | .667 | .672 | .612 | **.649** |
+     | 4GB | .677 | .677 | **.691** | .700 | .704 | .660 | **.690** |
+     | 8GB | .724 | .724 | **.733** | .733 | .733 | .714 | **.727** |
+
+     - MLC+tinylfu：1GB **+4.2pp**（从低于 LRU 1.6pp → 高于 LRU 2.6pp）；4GB **+3.0pp**
+       追平 ARC（差 1pp）；8GB 贴近 ARC/Cacheus（差 0.5pp）。对 ARC 的差距 1GB 收
+       61%、4GB 收 75%。
+     - HCC+tinylfu：各容量 +0.8~1.5pp，8GB(.733) 直接追平 ARC/Cacheus。
+   - **方案 B 单独基本无效（+0.5pp，freqB-eval-C-seed1-0614）**：印证 五.2/五.4——
+     "只改 countdown/只数 miss"信号太弱；起作用的是**准入拒绝 + 全访问计数**。
+     zipfian 里热 key 多为命中、极少重 insert，insert-only 计数看不到它们；且常驻
+     热块本就被 Lookup 顶到 countdown=3，改初值无增益。
+   - **吞吐**：MLC tinylfu 吞吐反升（8GB 1053 vs base 783，拒冷块省淘汰）；HCC
+     tinylfu 8GB −9.5%（采样查找计数代价）。注意 **Cacheus 大缓存吞吐很差**
+     （8GB 644 且递减），故 8GB 处 tinylfu **命中追平 Cacheus 而吞吐高 60%+**。
+   - **仍剩**：1GB/2GB 小缓存比 ARC/Cacheus 低 2~3pp；可试 `freq_lookup_sample_log2=0`
+     （每次查找计数，频次更准）或扫 cold 阈值，代价是热路径再多点开销。
+   - **新 prop / 方案**：`rocksdb.hcc_frequency_aware_admission`（B）、
+     `rocksdb.hcc_freq_admission_doorkeeper` + `rocksdb.hcc_freq_lookup_sample_log2`（A）、
+     `rocksdb.hcc_freq_admission_cold/warm_threshold`；方案 `hcc_freq`/`hcc_tinylfu`、
+     `mlc_hcc_all_levels_sharded_{freq,tinylfu}`（及 `_freq_strict`）。
+   - **铁律提醒**：本次改了 `include/rocksdb/cache.h` 的 `HyperClockCacheOptions`
+     布局，已连带重编 `ycsbc`（见 五.6）。

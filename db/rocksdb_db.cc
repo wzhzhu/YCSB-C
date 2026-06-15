@@ -251,6 +251,16 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
         strict_capacity_limit);
     hcc_opts.hash_seed = cache_hash_seed;
     hcc_opts.probation_insert = (cache_type == "sr_hyper_clock_cache");
+    hcc_opts.frequency_aware_admission =
+        ParseBool(props, "rocksdb.hcc_frequency_aware_admission", false);
+    hcc_opts.freq_admission_cold_threshold = static_cast<uint32_t>(ParseUint64(
+        props, "rocksdb.hcc_freq_admission_cold_threshold", 1));
+    hcc_opts.freq_admission_warm_threshold = static_cast<uint32_t>(ParseUint64(
+        props, "rocksdb.hcc_freq_admission_warm_threshold", 2));
+    hcc_opts.freq_admission_doorkeeper =
+        ParseBool(props, "rocksdb.hcc_freq_admission_doorkeeper", false);
+    hcc_opts.freq_lookup_sample_log2 = static_cast<uint32_t>(ParseUint64(
+        props, "rocksdb.hcc_freq_lookup_sample_log2", 1));
 
     const int srhcc_start_level =
         ParseInt(props, "rocksdb.multi_level_cache_srhcc_start_level", -1);
@@ -418,6 +428,16 @@ std::shared_ptr<rocksdb::Cache> CreateBlockCache(
                                          cache_numshardbits,
                                          strict_capacity_limit);
     opts.hash_seed = cache_hash_seed;
+    opts.frequency_aware_admission =
+        ParseBool(props, "rocksdb.hcc_frequency_aware_admission", false);
+    opts.freq_admission_cold_threshold = static_cast<uint32_t>(ParseUint64(
+        props, "rocksdb.hcc_freq_admission_cold_threshold", 1));
+    opts.freq_admission_warm_threshold = static_cast<uint32_t>(ParseUint64(
+        props, "rocksdb.hcc_freq_admission_warm_threshold", 2));
+    opts.freq_admission_doorkeeper =
+        ParseBool(props, "rocksdb.hcc_freq_admission_doorkeeper", false);
+    opts.freq_lookup_sample_log2 = static_cast<uint32_t>(ParseUint64(
+        props, "rocksdb.hcc_freq_lookup_sample_log2", 1));
     return opts.MakeSharedCache();
   }
 
