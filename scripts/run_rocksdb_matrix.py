@@ -359,6 +359,21 @@ def parse_args() -> argparse.Namespace:
         help="Keep per-case RocksDB directories after each run.",
     )
     p.add_argument(
+        "--db-run-id",
+        default=None,
+        help="run-id used for the shared RocksDB *storage* path "
+        "(<db-root-dir>/<db-run-id>/...). Defaults to --run-id. Set this to "
+        "point a new results run at a DB filled by an earlier run (for reuse).",
+    )
+    p.add_argument(
+        "--reuse-existing-db",
+        action="store_true",
+        help="With reuse_if_readonly: if the shared DB dir already exists and is "
+        "non-empty, skip the initial clean+load and reuse it as-is. The data "
+        "params (recordcount, field/raw sizes, insertorder, ...) MUST match the "
+        "original fill. Implies the shared DB is preserved (not deleted) at end.",
+    )
+    p.add_argument(
         "--extra-prop",
         action="append",
         default=[],
@@ -465,6 +480,7 @@ def run_once(
     results_dir: pathlib.Path,
     db_root_dir: pathlib.Path,
     run_id: str,
+    db_run_id: str,
     workload: str,
     scheme: str,
     cache_bytes: int,
@@ -487,7 +503,7 @@ def run_once(
     props["rocksdb.cache_numshardbits"] = str(shard_bits)
     props["threadcount"] = str(threads)
     props["skipload"] = "true" if skip_load else "false"
-    db_dir = db_root_dir / run_id / db_subdir
+    db_dir = db_root_dir / db_run_id / db_subdir
     props["rocksdb.dir"] = str(db_dir)
     db_dir.parent.mkdir(parents=True, exist_ok=True)
     if clean_db_before_run and db_dir.exists():
@@ -697,6 +713,7 @@ def main() -> int:
         return 2
 
     run_id = args.run_id or dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    db_run_id = args.db_run_id or run_id
     overrides: Dict[str, str] = {}
     if args.recordcount is not None:
         overrides["recordcount"] = str(args.recordcount)
@@ -776,8 +793,24 @@ def main() -> int:
         if reuse_db:
             db_subdir = shared_db_subdirs.get(wl, f"shared/wl{wl}")
             shared_db_subdirs[wl] = db_subdir
-            skip_load = wl in shared_loaded_workloads
-            clean_db_before_run = wl not in shared_loaded_workloads
+            already_loaded = wl in shared_loaded_workloads
+            # Reuse a pre-existing fill: if the shared DB dir already exists and
+            # is non-empty, skip the initial clean+load and read it as-is.
+            shared_path = db_root_dir / db_run_id / db_subdir
+            existing = (
+                args.reuse_existing_db
+                and not already_loaded
+                and shared_path.is_dir()
+                and any(shared_path.iterdir())
+            )
+            if existing:
+                print(
+                    f"[INFO] reusing existing DB at {shared_path} (skip load)",
+                    flush=True,
+                )
+                shared_loaded_workloads.add(wl)
+            skip_load = already_loaded or existing
+            clean_db_before_run = not (already_loaded or existing)
             cleanup_after_run = False
         else:
             db_subdir = f"wl{wl}-{scheme}-c{cache_bytes}-t{t}-s{sb}-r{r}"
@@ -790,6 +823,7 @@ def main() -> int:
             results_dir,
             db_root_dir,
             run_id,
+            db_run_id,
             wl,
             scheme,
             cache_bytes,
@@ -819,9 +853,9 @@ def main() -> int:
     md_path = results_dir / "summary.md"
     emit_markdown(rows, md_path)
 
-    if (not args.keep_db) and shared_db_subdirs:
+    if (not args.keep_db) and (not args.reuse_existing_db) and shared_db_subdirs:
         for subdir in shared_db_subdirs.values():
-            shared_dir = db_root_dir / run_id / subdir
+            shared_dir = db_root_dir / db_run_id / subdir
             if shared_dir.exists():
                 remove_tree_with_retry(shared_dir)
 
