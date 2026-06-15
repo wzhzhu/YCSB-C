@@ -827,3 +827,31 @@
      `mlc_hcc_all_levels_sharded_{freq,tinylfu}`（及 `_freq_strict`）。
    - **铁律提醒**：本次改了 `include/rocksdb/cache.h` 的 `HyperClockCacheOptions`
      布局，已连带重编 `ycsbc`（见 五.6）。
+
+8. **【待解，暂不改码，2026-06-15】MLC 在写负载下的 trivial-move 跨层缓存失效**
+   - **现象/原理**：MLC 的 cache key 是"扩展 key" = 16B 真实 key + 第 17B level tag，
+     `RouteLevelByKey` 按 level tag 选子缓存（存取只用前 16B base_key）。level tag 取
+     自 `rep_->cache_key_level`，它在**每次访问该 SST 时刷新成文件当前 level**
+     (`table_cache.cc::refresh_cache_key_level` → `BlockBasedTable::UpdateCacheKeyLevel`)。
+     于是当 compaction 把一个 SST **原封不动下移**(trivial move，file_number 不变 →
+     base_key 不变)到下一层时：该块若在 `sub_cache[N]`，下次访问的 level tag 变成
+     N+1 → 路由到 `sub_cache[N+1]` → **miss**(块还躺在 `sub_cache[N]` 成死重)→ 被动
+     从盘重读再塞进 `sub_cache[N+1]`。而统一 LRU 因 cache key 不含 level、base_key 不变
+     → 直接命中。即写负载下 MLC 会比 LRU 多出这部分 trivial-move 惩罚。
+   - **边界**：
+     - 只读负载(wlC)测量阶段无 compaction → **无影响**，当前所有 wlC 结论不受此问题
+       影响。
+     - 仅 **trivial move** 受影响。rewrite 型 compaction 会把块并入**新 file_number**
+       的 SST → base_cache_key 整个变 → 旧条目在**任何 cache(含 LRU)都失效**，不是
+       MLC 独有损失。hashed(重叠)负载多为重写、trivial move 较少；ordered/顺序负载
+       才会 trivial move 占主导。
+   - **设计取舍**：level tag 跟随当前 level 换来"按当前 level 精确分层路由/分账"
+     (MLC 分层定容的根基)，代价就是 trivial move 那一下 miss + 短暂双缓存。备选是
+     "level tag 冻结在出生层"——不丢 trivial-move 命中，但块会记在错误层、破坏分层
+     sizing。
+   - **已有缓解(目前关闭)**：MLC Lookup 在子缓存 miss 后会回落查**与 level 无关的
+     共享池** `SharedCache()`（`multi_level_cache.cc`），把
+     `multi_level_cache_shared_pool_ratio` 调 >0 可让被移动的块进共享池、跨层命中。
+     当前所有方案该比率为 `0.0`。
+   - **行动项(暂缓)**：设计写负载实验(wlA/wlF 或 wlC 边读边触发 compaction)量化此
+     惩罚，并扫 `shared_pool_ratio` 看能补回多少；暂不做代码改动。
