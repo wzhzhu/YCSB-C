@@ -59,7 +59,7 @@ SCHEMES = {
         "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
         "rocksdb.multi_level_cache_auto_adjust": "true",
         "rocksdb.multi_level_cache_allocator_mode": "model",
-        "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
+        "rocksdb.multi_level_cache_adjust_interval_ms": "5000",
         # robust_hit_rate (alpha = 1/hit_rate) instead of the default
         # constant_one: the uniform within-level model starves huge bottom
         # levels (L6 got 0 bytes at 1-2GB budgets despite 84% of traffic).
@@ -73,7 +73,7 @@ SCHEMES = {
         "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
         "rocksdb.multi_level_cache_auto_adjust": "true",
         "rocksdb.multi_level_cache_allocator_mode": "model",
-        "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
+        "rocksdb.multi_level_cache_adjust_interval_ms": "5000",
         "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
     },
     "mlc_hcc_dynamic_srhcc_sharded": {
@@ -84,7 +84,7 @@ SCHEMES = {
         "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
         "rocksdb.multi_level_cache_auto_adjust": "true",
         "rocksdb.multi_level_cache_allocator_mode": "model",
-        "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
+        "rocksdb.multi_level_cache_adjust_interval_ms": "5000",
         "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
         "rocksdb.multi_level_cache_dynamic_srhcc_enable": "true",
         "rocksdb.multi_level_cache_dynamic_srhcc_check_interval_ops": "4096",
@@ -121,7 +121,7 @@ SCHEMES = {
         "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
         "rocksdb.multi_level_cache_auto_adjust": "true",
         "rocksdb.multi_level_cache_allocator_mode": "model",
-        "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
+        "rocksdb.multi_level_cache_adjust_interval_ms": "5000",
         "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
         # Shard only the bottom level (L6) with the configured bits (6, aligned
         # with the baselines); upper levels unsharded. Same strategy as
@@ -145,7 +145,40 @@ SCHEMES = {
         "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
         "rocksdb.multi_level_cache_auto_adjust": "true",
         "rocksdb.multi_level_cache_allocator_mode": "model",
-        "rocksdb.multi_level_cache_adjust_interval_ms": "1000",
+        "rocksdb.multi_level_cache_adjust_interval_ms": "5000",
+        "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
+        "rocksdb.cache_numshardbits": "6",
+        "rocksdb.multi_level_cache_shard_bottom_only": "true",
+    },
+    # DEBUG-only: identical to mlc_hcc_all_levels_sharded but with the periodic
+    # capacity allocator disabled. Used to isolate whether the write-workload
+    # slowdown comes from the allocator (per-round PurgeToCapacity churn) or from
+    # the MLC routing/sub-cache hot path. Not part of the standard matrix.
+    "mlc_dbg_noadjust": {
+        "rocksdb.cache_type": "hyper_clock_cache",
+        "rocksdb.use_multi_level_cache": "true",
+        "rocksdb.num_levels": "7",
+        "rocksdb.multi_level_cache_srhcc_start_level": "-1",
+        "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
+        "rocksdb.multi_level_cache_auto_adjust": "false",
+        "rocksdb.multi_level_cache_allocator_mode": "model",
+        "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
+        "rocksdb.cache_numshardbits": "6",
+        "rocksdb.multi_level_cache_shard_bottom_only": "true",
+    },
+    # DEBUG-only: allocator ON but interval = 1h, so it runs essentially once
+    # (initial reconfiguration) and then never again. Discriminates "periodic
+    # churn" (this should be as fast as noadjust) from "the resulting capacity
+    # distribution is itself harmful" (this stays as slow as the default).
+    "mlc_dbg_slowadjust": {
+        "rocksdb.cache_type": "hyper_clock_cache",
+        "rocksdb.use_multi_level_cache": "true",
+        "rocksdb.num_levels": "7",
+        "rocksdb.multi_level_cache_srhcc_start_level": "-1",
+        "rocksdb.multi_level_cache_shared_pool_ratio": "0.0",
+        "rocksdb.multi_level_cache_auto_adjust": "true",
+        "rocksdb.multi_level_cache_allocator_mode": "model",
+        "rocksdb.multi_level_cache_adjust_interval_ms": "3600000",
         "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
         "rocksdb.cache_numshardbits": "6",
         "rocksdb.multi_level_cache_shard_bottom_only": "true",

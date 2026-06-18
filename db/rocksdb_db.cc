@@ -543,7 +543,7 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     rocksdb::MultiLevelAllocationOptions alloc_opts;
     alloc_opts.interval_ms = static_cast<uint64_t>(
         std::max(1, ParseInt(props, "rocksdb.multi_level_cache_adjust_interval_ms",
-                             1000)));
+                             5000)));
     alloc_opts.smoothing_ratio =
         ParseDouble(props, "rocksdb.multi_level_cache_adjust_smoothing_ratio",
                     0.5);
@@ -568,6 +568,14 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.data_cap_margin_ratio = ParseDouble(
         props, "rocksdb.multi_level_cache_data_cap_margin_ratio",
         alloc_opts.data_cap_margin_ratio);
+    // Model-stability gate: skip a round when two consecutive raw solved target
+    // allocations disagree by more than this fraction of the total capacity (the
+    // model signal is too noisy to act on -- typical of write-heavy / low
+    // cache-to-data-ratio workloads). Holds the previous allocation and lets the
+    // interval back off. 0 disables the gate.
+    alloc_opts.model_stability_threshold = ParseDouble(
+        props, "rocksdb.multi_level_cache_model_stability_threshold",
+        alloc_opts.model_stability_threshold);
 
     const std::string mode = props.GetProperty(
         "rocksdb.multi_level_cache_allocator_mode", "model");
@@ -597,13 +605,19 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
         props, "rocksdb.multi_level_cache_use_effective_data_size", false);
     const size_t alpha_window_rounds = static_cast<size_t>(std::max(
         1, ParseInt(props, "rocksdb.multi_level_cache_alpha_window_rounds", 5)));
+    // Use the latest data-size sample (no window averaging): rounds=1 keeps only
+    // the most recent sample, and the time-weighted average of a single sample
+    // equals that sample's instantaneous value. The model-stability gate now
+    // provides the stability that the running mean used to, so we feed the
+    // freshest level data size straight through. data_size_window_ms is then
+    // irrelevant (only one sample is ever retained).
     const size_t data_window_rounds = static_cast<size_t>(std::max(
         1,
-        ParseInt(props, "rocksdb.multi_level_cache_data_size_window_rounds", 5)));
+        ParseInt(props, "rocksdb.multi_level_cache_data_size_window_rounds", 1)));
     const uint64_t data_window_us =
         static_cast<uint64_t>(std::max(
             1, ParseInt(props, "rocksdb.multi_level_cache_data_size_window_ms",
-                        5000))) *
+                        30000))) *
         1000;
     const bool use_constant_one_alpha = alpha_estimator != "robust_hit_rate";
 
