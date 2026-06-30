@@ -264,6 +264,21 @@ SCHEMES["mlc_hcc_all_levels_sharded_tinylfu"] = {
     "rocksdb.hcc_freq_admission_warm_threshold": "3",
 }
 
+# Data-share-weighted anti-starvation floor (KNOWN_ISSUES: MLC allocator
+# deep-level starvation -> compaction stall -> write stall under sustained
+# write load). Default the floor pool to 5% of the total cache budget for
+# every MLC model-allocator scheme, distributed across active levels in
+# proportion to their data size (so L6 holding ~99% of data gets ~90% of the
+# floor pool). Enforced before the model-stability gate and applied even on
+# gate-skip, so a starved deep level is always relieved. Applied to all mlc_*
+# schemes that haven't already overridden the prop (so a future "nofloor"
+# variant can set "0.0"). Non-MLC schemes ignore the prop. Tunable: sweep
+# 0.02 / 0.05 / 0.10 by overriding this key per scheme.
+for _name, _props in SCHEMES.items():
+    if _name.startswith("mlc_"):
+        _props.setdefault(
+            "rocksdb.multi_level_cache_min_active_level_capacity_ratio", "0.05")
+
 COMMON_PROPS = {
     "workload": "com.yahoo.ycsb.workloads.CoreWorkload",
     # 100GB with 1024B KV assumption => 104,857,600 records.

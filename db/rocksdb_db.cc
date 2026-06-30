@@ -8,6 +8,7 @@
 #include <cstring>
 #include <deque>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
@@ -568,6 +569,35 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.data_cap_margin_ratio = ParseDouble(
         props, "rocksdb.multi_level_cache_data_cap_margin_ratio",
         alloc_opts.data_cap_margin_ratio);
+    // Data-share-weighted anti-starvation floor: reserve this fraction of the
+    // total budget as a floor pool distributed across active levels in
+    // proportion to their data size (deep levels get a proportionally larger
+    // floor), with each active level also guaranteed an absolute minimum.
+    // Enforced before the model-stability gate and applied even on gate-skip,
+    // so a starved deep level is always relieved (breaks the doom loop where
+    // the gate suppresses the corrective swing out of a starved state, which
+    // otherwise leads to compaction stall -> write stall -> throughput
+    // collapse under sustained write load). 0 disables.
+    alloc_opts.min_active_level_capacity_ratio = ParseDouble(
+        props, "rocksdb.multi_level_cache_min_active_level_capacity_ratio",
+        alloc_opts.min_active_level_capacity_ratio);
+    alloc_opts.min_active_level_floor_bytes = static_cast<size_t>(
+        std::max(0, ParseInt(
+            props, "rocksdb.multi_level_cache_min_active_level_floor_bytes",
+            static_cast<int>(std::min<uint64_t>(
+                alloc_opts.min_active_level_floor_bytes,
+                static_cast<uint64_t>(std::numeric_limits<int>::max()))))));
+    // L0-file-count gate for the floor relief: the floor only fires when L0 is
+    // backing up (compaction falling behind -- the doom-loop signature), so a
+    // healthy read-only workload (L0 ~1 file) is never perturbed. 0 = fire
+    // whenever a level is below its floor (aggressive; perturbs read-only).
+    alloc_opts.floor_relief_l0_file_threshold = static_cast<uint64_t>(
+        std::max(0, ParseInt(
+            props,
+            "rocksdb.multi_level_cache_floor_relief_l0_file_threshold",
+            static_cast<int>(std::min<uint64_t>(
+                alloc_opts.floor_relief_l0_file_threshold,
+                static_cast<uint64_t>(std::numeric_limits<int>::max()))))));
     // Model-stability gate: skip a round when two consecutive raw solved target
     // allocations disagree by more than this fraction of the total capacity (the
     // model signal is too noisy to act on -- typical of write-heavy / low
@@ -623,7 +653,7 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
 
     multi_level_allocator_ = std::make_unique<rocksdb::MultiLevelCacheAllocator>(
         multi_level_cache_,
-        [cache = multi_level_cache_, alpha_floor, alpha_max,
+        [cache = multi_level_cache_, db = db_.get(), alpha_floor, alpha_max,
          use_effective_data_size, alpha_window_rounds, data_window_rounds,
          data_window_us, use_constant_one_alpha,
          prev_lookups = std::vector<uint64_t>{},
@@ -635,10 +665,20 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
          raw_data_history =
              std::vector<std::deque<std::pair<uint64_t, double>>>{}](
             std::vector<double>* lambda, std::vector<double>* data,
-            std::vector<double>* alpha) mutable {
+            std::vector<double>* alpha, uint64_t* l0_file_count) mutable {
           if (cache == nullptr || lambda == nullptr || data == nullptr ||
               alpha == nullptr) {
             return false;
+          }
+          // L0 SST file count = compaction-backlog signal for the floor relief
+          // gate. Read every round (cheap int property). 0 on any failure or
+          // when the DB handle is null (keeps the gate conservative-off).
+          if (l0_file_count != nullptr) {
+            uint64_t v = 0;
+            if (db != nullptr) {
+              db->GetIntProperty("rocksdb.num-files-at-level0", &v);
+            }
+            *l0_file_count = v;
           }
           const auto stats = cache->GetLevelMetricsSnapshot();
           const size_t level_count = stats.lookups.size();
@@ -768,7 +808,22 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
             double derived_alpha = prev_alpha[level];
             const size_t capacity_bytes = stats.capacities[level];
             double observed_hit_rate = -1.0;
-            if (delta_lookups > 0 && capacity_bytes > 0 &&
+            // Ill-conditioning guard: the inversion derived_alpha = -(D/c) *
+            // log(miss) blows up when the level's cache capacity c is a tiny
+            // fraction of its data size D (a starved deep level). The D/c
+            // multiplier turns small miss-rate perturbations into large,
+            // oscillating alpha estimates that the model-stability gate then
+            // suppresses, freezing the level in its starved state (doom loop).
+            // Skip the inversion entirely in the starved regime and collapse
+            // confidence to 0 (fall back to the prior). The data-share floor
+            // guarantees the level still receives capacity; once it recovers
+            // above the 0.5% threshold the inversion resumes. Belt-and-
+            // suspenders -- the floor is the primary fix.
+            const bool starved =
+                capacity_bytes > 0 && raw_level_data > 0.0 &&
+                static_cast<double>(capacity_bytes) <
+                    0.005 * raw_level_data;
+            if (!starved && delta_lookups > 0 && capacity_bytes > 0 &&
                 raw_level_data > 0.0) {
               observed_history[level].push_back({delta_hits, delta_lookups});
               while (observed_history[level].size() > alpha_window_rounds) {
@@ -792,8 +847,10 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
             }
 
             const double confidence =
-                std::min(1.0, static_cast<double>(delta_lookups) /
-                                  static_cast<double>(kAlphaConfidenceLookups));
+                starved
+                    ? 0.0
+                    : std::min(1.0, static_cast<double>(delta_lookups) /
+                                        static_cast<double>(kAlphaConfidenceLookups));
             const double shrunk_alpha =
                 confidence * derived_alpha + (1.0 - confidence) * kAlphaPrior;
             const double smoothed_alpha =
