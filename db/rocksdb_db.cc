@@ -606,6 +606,27 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.model_stability_threshold = ParseDouble(
         props, "rocksdb.multi_level_cache_model_stability_threshold",
         alloc_opts.model_stability_threshold);
+    // Ill-conditioning guard toggle: when on, the alpha inversion is skipped
+    // for starved levels (capacity < 0.5% of data) to stop alpha blowing up in
+    // the doom loop. With compaction excluded from alpha (foreground-only) and
+    // the data-share floor as the primary anti-starvation fix, this guard is
+    // redundant for the refined model -- expose it so it can be disabled.
+    const bool ill_conditioning_guard_enabled = ParseBool(
+        props, "rocksdb.multi_level_cache_ill_conditioning_guard", true);
+    // Compaction-modeling toggles. Default = config C (refined): lambda uses
+    // total lookups (compaction included, so write-path pressure keeps
+    // signaling), alpha uses foreground-only (compaction excluded from the
+    // hit-curve). Set lambda_exclude_compaction=true to also drop compaction
+    // from the access-frequency channel -> config B (full exclusion). Provided
+    // to actually measure B to completion.
+    const bool lambda_exclude_compaction = ParseBool(
+        props, "rocksdb.multi_level_cache_lambda_exclude_compaction", false);
+    // Symmetric toggle for the alpha channel (default true = compaction
+    // excluded from the hit-curve). Set false to include compaction in alpha
+    // -> config A (full inclusion) when lambda_exclude_compaction is also
+    // false.
+    const bool alpha_exclude_compaction = ParseBool(
+        props, "rocksdb.multi_level_cache_alpha_exclude_compaction", true);
 
     const std::string mode = props.GetProperty(
         "rocksdb.multi_level_cache_allocator_mode", "model");
@@ -633,6 +654,29 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
         props, "rocksdb.multi_level_cache_alpha_max", 100.0);
     const bool use_effective_data_size = ParseBool(
         props, "rocksdb.multi_level_cache_use_effective_data_size", false);
+    // Enable per-level HLL working-set (distinct-block) tracking without driving
+    // the saturation scale, for the reuse diagnostic (MLC_WSS_DIAG). Lets us
+    // study reuse structure without perturbing allocation.
+    const bool track_working_set = ParseBool(
+        props, "rocksdb.multi_level_cache_track_working_set", false);
+    // Reuse-channel model fix (finalized default for product MLC schemes): set
+    // lambda to the cacheable (reusable) access rate lambda_i = max(eps,
+    // fg_lookups_i - distinct_i) instead of raw lookups. High-traffic/no-reuse
+    // deep levels (fg_lookups ~= distinct) then get lambda ~= 0 -> marginal gain
+    // a_i = lambda*alpha/D ~= 0 -> the solver starves them from the model
+    // itself, independent of D and of current capacity (no doom loop). Evidence:
+    // reuse_ratio cleanly separates useful L3/L4 (0.11-0.18) from useless L5/L6
+    // (~0). Keeps D physical. distinct is estimated by the per-level HLL.
+    const bool use_reuse_lambda = ParseBool(
+        props, "rocksdb.multi_level_cache_use_reuse_lambda", false);
+    const uint32_t working_set_sample_shift = static_cast<uint32_t>(std::max(
+        0, ParseInt(props,
+                     "rocksdb.multi_level_cache_working_set_sample_shift", 0)));
+    if ((track_working_set || use_reuse_lambda) &&
+        multi_level_cache_ != nullptr) {
+      multi_level_cache_->SetWorkingSetTrackingEnabled(
+          true, working_set_sample_shift);
+    }
     const size_t alpha_window_rounds = static_cast<size_t>(std::max(
         1, ParseInt(props, "rocksdb.multi_level_cache_alpha_window_rounds", 5)));
     // Use the latest data-size sample (no window averaging): rounds=1 keeps only
@@ -654,10 +698,14 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     multi_level_allocator_ = std::make_unique<rocksdb::MultiLevelCacheAllocator>(
         multi_level_cache_,
         [cache = multi_level_cache_, db = db_.get(), alpha_floor, alpha_max,
-         use_effective_data_size, alpha_window_rounds, data_window_rounds,
-         data_window_us, use_constant_one_alpha,
+         use_effective_data_size, track_working_set,
+         use_reuse_lambda, alpha_window_rounds, data_window_rounds,
+         data_window_us, use_constant_one_alpha, ill_conditioning_guard_enabled,
+         lambda_exclude_compaction, alpha_exclude_compaction,
          prev_lookups = std::vector<uint64_t>{},
          prev_hits = std::vector<uint64_t>{},
+         prev_fg_lookups = std::vector<uint64_t>{},
+         prev_fg_hits = std::vector<uint64_t>{},
          prev_alpha = std::vector<double>{},
          prev_effective_data = std::vector<double>{},
          observed_history =
@@ -683,20 +731,33 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
           const auto stats = cache->GetLevelMetricsSnapshot();
           const size_t level_count = stats.lookups.size();
           if (level_count == 0 || stats.hits.size() != level_count ||
+              stats.fg_lookups.size() != level_count ||
+              stats.fg_hits.size() != level_count ||
               stats.capacities.size() != level_count ||
               stats.data_sizes.size() != level_count) {
             return false;
           }
           if (prev_lookups.size() != level_count ||
               prev_hits.size() != level_count ||
+              prev_fg_lookups.size() != level_count ||
+              prev_fg_hits.size() != level_count ||
               prev_alpha.size() != level_count ||
               prev_effective_data.size() != level_count ||
               observed_history.size() != level_count ||
               raw_data_history.size() != level_count) {
             prev_lookups = stats.lookups;
             prev_hits = stats.hits;
+            prev_fg_lookups = stats.fg_lookups;
+            prev_fg_hits = stats.fg_hits;
             prev_alpha.assign(level_count, 1.0);
             prev_effective_data.assign(level_count, 1.0);
+            if (use_reuse_lambda || track_working_set) {
+              // Prime the sketch so the first real round's distinct count covers
+              // the same window as the first real delta_fg_lookups (otherwise the
+              // first reuse-lambda would subtract a longer-window distinct and be
+              // spuriously conservative).
+              cache->DrainForegroundWorkingSetDistinct();
+            }
             for (size_t level = 0; level < level_count; ++level) {
               prev_effective_data[level] =
                   stats.data_sizes[level] > 0
@@ -727,6 +788,50 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
                   ? static_cast<double>(total_observed_data) /
                         static_cast<double>(observed_levels)
                   : 1.0;
+
+          // Per-level distinct foreground blocks this window from the per-level
+          // HLL. Consumed by the reuse-lambda path below (lambda_i = max(eps,
+          // fg_lookups_i - distinct_i)). Empty when tracking is off. Draining
+          // also resets the sketch for the next window.
+          std::vector<double> ws_distinct;
+          if (track_working_set || use_reuse_lambda) {
+            ws_distinct = cache->DrainForegroundWorkingSetDistinct();
+            const std::vector<double>& distinct = ws_distinct;
+            if (distinct.size() == level_count) {
+              // Reuse diagnostic: per level, contrast the foreground access
+              // volume against the distinct footprint and realized hits.
+              // Computed here because prev_fg_* are still the previous window's
+              // values.
+              static const bool kWssDiag = getenv("MLC_WSS_DIAG") != nullptr;
+              if (kWssDiag) {
+                std::string line;
+                for (size_t level = 0; level < level_count; ++level) {
+                  const uint64_t fgl =
+                      stats.fg_lookups[level] >= prev_fg_lookups[level]
+                          ? stats.fg_lookups[level] - prev_fg_lookups[level]
+                          : 0;
+                  const uint64_t fgh =
+                      stats.fg_hits[level] >= prev_fg_hits[level]
+                          ? stats.fg_hits[level] - prev_fg_hits[level]
+                          : 0;
+                  const double dist = std::max(0.0, distinct[level]);
+                  // reuse_ratio = 1 - distinct/fg_lookups: fraction of
+                  // foreground accesses that are repeats within the window.
+                  const double reuse =
+                      fgl > 0 ? 1.0 - dist / static_cast<double>(fgl) : 0.0;
+                  char buf[160];
+                  snprintf(buf, sizeof(buf),
+                           "L%zu[fgl=%llu fgh=%llu dist=%.0f reuse=%.3f dMiB=%llu] ",
+                           level, (unsigned long long)fgl,
+                           (unsigned long long)fgh, dist, reuse,
+                           (unsigned long long)(stats.data_sizes[level] >> 20));
+                  line += buf;
+                }
+                fprintf(stderr, "[MLC_WSS] %s\n", line.c_str());
+              }
+            }
+          }
+
           constexpr double kLambdaEpsilon = 1e-6;
           constexpr double kAlphaPrior = 1.0;
           constexpr uint64_t kAlphaConfidenceLookups = 5000;
@@ -751,12 +856,47 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
                     ? curr_lookups - prev_lookups[level]
                     : 0;
             const uint64_t delta_hits =
-                curr_hits >= prev_hits[level] ? curr_hits - prev_hits[level]
-                                              : 0;
+                curr_hits >= prev_hits[level] ? curr_hits - prev_hits[level] : 0;
+            // Foreground-only deltas drive alpha (hit-curve shape): compaction
+            // reads are streaming/one-shot, so their hits/misses must not
+            // dilute the foreground hit rate. Total deltas still drive lambda
+            // (access frequency) so compaction activity keeps signaling
+            // write-path pressure on levels like L0.
+            const uint64_t curr_fg_lookups = stats.fg_lookups[level];
+            const uint64_t curr_fg_hits = stats.fg_hits[level];
+            const uint64_t delta_fg_lookups =
+                curr_fg_lookups >= prev_fg_lookups[level]
+                    ? curr_fg_lookups - prev_fg_lookups[level]
+                    : 0;
+            const uint64_t delta_fg_hits =
+                curr_fg_hits >= prev_fg_hits[level]
+                    ? curr_fg_hits - prev_fg_hits[level]
+                    : 0;
 
-            (*lambda)[level] = delta_lookups > 0
-                                   ? static_cast<double>(delta_lookups)
-                                   : kLambdaEpsilon;
+            // config B drops compaction from the frequency channel too.
+            const uint64_t lambda_delta =
+                lambda_exclude_compaction ? delta_fg_lookups : delta_lookups;
+            if (use_reuse_lambda && ws_distinct.size() == level_count) {
+              // Reuse-channel: lambda = cacheable (reusable) access rate =
+              // foreground accesses minus the distinct footprint touched this
+              // window. Near-zero for one-shot/no-reuse deep levels -> the
+              // model starves them via a vanishing marginal gain, without
+              // touching D or the capacity feedback loop.
+              const double reusable =
+                  static_cast<double>(delta_fg_lookups) - ws_distinct[level];
+              (*lambda)[level] =
+                  reusable > 0.0 ? reusable : kLambdaEpsilon;
+            } else {
+              (*lambda)[level] = lambda_delta > 0
+                                     ? static_cast<double>(lambda_delta)
+                                     : kLambdaEpsilon;
+            }
+            // Alpha channel: foreground-only by default (compaction excluded);
+            // set alpha_exclude_compaction=false to feed total deltas (config A).
+            const uint64_t alpha_delta_lookups =
+                alpha_exclude_compaction ? delta_fg_lookups : delta_lookups;
+            const uint64_t alpha_delta_hits =
+                alpha_exclude_compaction ? delta_fg_hits : delta_hits;
             const double raw_level_data_instant =
                 stats.data_sizes[level] > 0
                     ? static_cast<double>(stats.data_sizes[level])
@@ -793,11 +933,15 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
                 raw_level_data = weighted_sum / denom;
               }
             }
+            // The model's saturation scale D is the on-disk data size (raw or
+            // effective-data path below), used consistently in both the alpha
+            // inversion and the capacity solve so the MRC stays self-consistent.
+            const double model_scale = raw_level_data;
             if (use_constant_one_alpha) {
               (*alpha)[level] = 1.0;
-              (*data)[level] = raw_level_data;
+              (*data)[level] = model_scale;
               prev_alpha[level] = 1.0;
-              prev_effective_data[level] = raw_level_data;
+              prev_effective_data[level] = model_scale;
               continue;
             }
 
@@ -818,14 +962,17 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
             // confidence to 0 (fall back to the prior). The data-share floor
             // guarantees the level still receives capacity; once it recovers
             // above the 0.5% threshold the inversion resumes. Belt-and-
-            // suspenders -- the floor is the primary fix.
+            // suspenders -- the floor is the primary fix. Toggleable because
+            // with compaction excluded from alpha the guard is redundant.
             const bool starved =
-                capacity_bytes > 0 && raw_level_data > 0.0 &&
+                ill_conditioning_guard_enabled && capacity_bytes > 0 &&
+                model_scale > 0.0 &&
                 static_cast<double>(capacity_bytes) <
-                    0.005 * raw_level_data;
-            if (!starved && delta_lookups > 0 && capacity_bytes > 0 &&
-                raw_level_data > 0.0) {
-              observed_history[level].push_back({delta_hits, delta_lookups});
+                    0.005 * model_scale;
+            if (!starved && alpha_delta_lookups > 0 && capacity_bytes > 0 &&
+                model_scale > 0.0) {
+              observed_history[level].push_back(
+                  {alpha_delta_hits, alpha_delta_lookups});
               while (observed_history[level].size() > alpha_window_rounds) {
                 observed_history[level].pop_front();
               }
@@ -842,14 +989,14 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
               const double miss_rate =
                   std::max(kMinMissRate, 1.0 - observed_hit_rate);
               derived_alpha =
-                  -(raw_level_data / static_cast<double>(capacity_bytes)) *
+                  -(model_scale / static_cast<double>(capacity_bytes)) *
                   std::log(miss_rate);
             }
 
             const double confidence =
                 starved
                     ? 0.0
-                    : std::min(1.0, static_cast<double>(delta_lookups) /
+                    : std::min(1.0, static_cast<double>(alpha_delta_lookups) /
                                         static_cast<double>(kAlphaConfidenceLookups));
             const double shrunk_alpha =
                 confidence * derived_alpha + (1.0 - confidence) * kAlphaPrior;
@@ -878,8 +1025,13 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
                   std::log(miss_rate);
               if (std::isfinite(observed_effective_data) &&
                   observed_effective_data > 0.0) {
+                // Confidence in the observed effective-data estimate scales
+                // with the sample count that produced observed_hit_rate, which
+                // comes from the alpha channel (foreground-only by default) --
+                // not the total lookups. Using total would overstate confidence
+                // when compaction dominates a level's traffic.
                 const double data_confidence = std::min(
-                    1.0, static_cast<double>(delta_lookups) /
+                    1.0, static_cast<double>(alpha_delta_lookups) /
                              static_cast<double>(kDataConfidenceLookups));
                 target_effective_data =
                     data_confidence * observed_effective_data +
@@ -898,12 +1050,14 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
             effective_level_data =
                 std::max(data_lower_bound,
                          std::min(effective_level_data, data_upper_bound));
-            (*data)[level] =
-                use_effective_data_size ? effective_level_data : raw_level_data;
+            (*data)[level] = use_effective_data_size ? effective_level_data
+                                                     : raw_level_data;
             prev_effective_data[level] = effective_level_data;
           }
           prev_lookups = stats.lookups;
           prev_hits = stats.hits;
+          prev_fg_lookups = stats.fg_lookups;
+          prev_fg_hits = stats.fg_hits;
           return true;
         },
         alloc_opts);
@@ -1007,6 +1161,8 @@ RocksdbDB::~RocksdbDB() {
     const auto snapshot = multi_level_cache_->GetLevelMetricsSnapshot();
     uint64_t total_lookups = 0;
     uint64_t total_hits = 0;
+    uint64_t total_fg_lookups = 0;
+    uint64_t total_fg_hits = 0;
     for (size_t i = 0; i < snapshot.lookups.size(); ++i) {
       const uint64_t lookups = snapshot.lookups[i];
       const uint64_t hits = snapshot.hits[i];
@@ -1021,6 +1177,35 @@ RocksdbDB::~RocksdbDB() {
                 << std::endl;
       std::cerr << "rocksdb\tmlc_level_" << i << "_hit_ratio\t"
                 << level_hit_ratio << std::endl;
+      // Foreground-only breakdown (excludes compaction-induced lookups) so we
+      // can see, per level: (1) what fraction of traffic is compaction, and
+      // (2) how the foreground-only hit rate differs from the total hit rate.
+      // This is the diagnostic that decides whether excluding compaction from
+      // the model can matter at all.
+      if (i < snapshot.fg_lookups.size() && i < snapshot.fg_hits.size()) {
+        const uint64_t fg_lookups = snapshot.fg_lookups[i];
+        const uint64_t fg_hits = snapshot.fg_hits[i];
+        total_fg_lookups += fg_lookups;
+        total_fg_hits += fg_hits;
+        const double fg_hit_ratio =
+            fg_lookups > 0
+                ? static_cast<double>(fg_hits) / static_cast<double>(fg_lookups)
+                : 0.0;
+        const uint64_t compaction_lookups =
+            lookups >= fg_lookups ? lookups - fg_lookups : 0;
+        const double compaction_fraction =
+            lookups > 0 ? static_cast<double>(compaction_lookups) /
+                              static_cast<double>(lookups)
+                        : 0.0;
+        std::cerr << "rocksdb\tmlc_level_" << i << "_fg_lookups\t" << fg_lookups
+                  << std::endl;
+        std::cerr << "rocksdb\tmlc_level_" << i << "_fg_hits\t" << fg_hits
+                  << std::endl;
+        std::cerr << "rocksdb\tmlc_level_" << i << "_fg_hit_ratio\t"
+                  << fg_hit_ratio << std::endl;
+        std::cerr << "rocksdb\tmlc_level_" << i << "_compaction_fraction\t"
+                  << compaction_fraction << std::endl;
+      }
       if (i < snapshot.capacities.size()) {
         std::cerr << "rocksdb\tmlc_level_" << i << "_capacity\t"
                   << snapshot.capacities[i] << std::endl;
@@ -1028,6 +1213,25 @@ RocksdbDB::~RocksdbDB() {
       if (i < snapshot.usages.size()) {
         std::cerr << "rocksdb\tmlc_level_" << i << "_usage\t"
                   << snapshot.usages[i] << std::endl;
+      }
+      // AutoHCC sparse-table Evict diagnostic: table slots (grow-only) vs live
+      // entries. A large table_address_count with small occupancy_count means
+      // the table stayed big after the allocator shrank this sub-cache, so
+      // every insert-time Evict sweeps a sparse oversized table.
+      if (i < snapshot.table_address_counts.size() &&
+          i < snapshot.occupancy_counts.size()) {
+        const size_t table_slots = snapshot.table_address_counts[i];
+        const size_t occ = snapshot.occupancy_counts[i];
+        const double occ_ratio =
+            table_slots > 0
+                ? static_cast<double>(occ) / static_cast<double>(table_slots)
+                : 0.0;
+        std::cerr << "rocksdb\tmlc_level_" << i << "_table_slots\t" << table_slots
+                  << std::endl;
+        std::cerr << "rocksdb\tmlc_level_" << i << "_occupancy\t" << occ
+                  << std::endl;
+        std::cerr << "rocksdb\tmlc_level_" << i << "_table_occupancy_ratio\t"
+                  << occ_ratio << std::endl;
       }
       if (i < snapshot.data_sizes.size()) {
         std::cerr << "rocksdb\tmlc_level_" << i << "_data_size\t"
@@ -1074,6 +1278,18 @@ RocksdbDB::~RocksdbDB() {
     std::cerr << "rocksdb\tmlc_total_lookups\t" << total_lookups << std::endl;
     std::cerr << "rocksdb\tmlc_total_hits\t" << total_hits << std::endl;
     std::cerr << "rocksdb\tmlc_total_hit_ratio\t" << total_level_hit_ratio
+              << std::endl;
+    // Foreground-only aggregate hit ratio (compaction lookups excluded). Better
+    // reflects the cache's value to the application than the total-traffic ratio
+    // above, which is diluted by one-shot compaction reads.
+    const double total_fg_hit_ratio =
+        total_fg_lookups > 0 ? static_cast<double>(total_fg_hits) /
+                                   static_cast<double>(total_fg_lookups)
+                             : 0.0;
+    std::cerr << "rocksdb\tmlc_total_fg_lookups\t" << total_fg_lookups
+              << std::endl;
+    std::cerr << "rocksdb\tmlc_total_fg_hits\t" << total_fg_hits << std::endl;
+    std::cerr << "rocksdb\tmlc_total_fg_hit_ratio\t" << total_fg_hit_ratio
               << std::endl;
   }
 }

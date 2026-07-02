@@ -262,6 +262,96 @@ SCHEMES["mlc_hcc_all_levels_sharded_tinylfu"] = {
     "rocksdb.hcc_freq_lookup_sample_log2": "1",
     "rocksdb.hcc_freq_admission_cold_threshold": "2",
     "rocksdb.hcc_freq_admission_warm_threshold": "3",
+    # NOTE: an experiment disabled the model-stability gate
+    # (model_stability_threshold=0) and the ill-conditioning guard
+    # (ill_conditioning_guard=false) on the theory that, with compaction
+    # excluded from alpha (foreground-only counters), the gates defending
+    # against compaction-induced model pathology were redundant. Verified
+    # REGRESSION on wlA t4 100M: >41min vs 31min baseline / 31.5min gated-
+    # refined. Root cause: without the stability gate every round applies
+    # (PurgeToCapacity churn returns -- the original P2 pathology) AND without
+    # the ill-cond guard the solver funds low-hit deep levels (L5 hit ~0.02,
+    # L6 hit ~0.009) that the gated model correctly starves, wasting capacity
+    # the high-hit L3/L4 (hit ~0.33) could use. Both gates are NOT redundant --
+    # keep them on. The ill_conditioning_guard prop stays plumbed (default true)
+    # for future experiments.
+}
+
+# Compaction-modeling A/B/C/D matrix (built on the tinylfu scheme). These
+# variants flip the two compaction toggles so all four can be measured to
+# completion from one binary:
+#   A = full inclusion    (lambda=total,      alpha=total)
+#   B = full exclusion    (lambda=foreground, alpha=foreground)
+#   C = lambda-total       (lambda=total,      alpha=foreground)  [legacy default]
+#   D = lambda-only excl.  (lambda=foreground, alpha=total)
+# NOTE: the binary's provider default is config C, but the FINALIZED_MLC loop
+# below now upgrades every product MLC scheme to config B + reuse-lambda (see
+# there). Each variant here pins its toggles explicitly and is excluded from
+# that loop, so the A/B/C/D comparison stays intact regardless of the default.
+SCHEMES["mlc_tinylfu_cfgA_fullinc"] = {
+    **SCHEMES["mlc_hcc_all_levels_sharded_tinylfu"],
+    "rocksdb.multi_level_cache_lambda_exclude_compaction": "false",
+    "rocksdb.multi_level_cache_alpha_exclude_compaction": "false",
+}
+SCHEMES["mlc_tinylfu_cfgB_fullexc"] = {
+    **SCHEMES["mlc_hcc_all_levels_sharded_tinylfu"],
+    "rocksdb.multi_level_cache_lambda_exclude_compaction": "true",
+    "rocksdb.multi_level_cache_alpha_exclude_compaction": "true",
+}
+SCHEMES["mlc_tinylfu_cfgD_lambdaexc"] = {
+    **SCHEMES["mlc_hcc_all_levels_sharded_tinylfu"],
+    "rocksdb.multi_level_cache_lambda_exclude_compaction": "true",
+    "rocksdb.multi_level_cache_alpha_exclude_compaction": "false",
+}
+# Config C (the legacy binary default) pinned as an explicit scheme so it stays
+# runnable as the A/B/C/D baseline now that the product schemes default to
+# config B + reuse-lambda. lambda=total lookups, alpha=foreground-only, no reuse.
+SCHEMES["mlc_tinylfu_cfgC_lambdatotal"] = {
+    **SCHEMES["mlc_hcc_all_levels_sharded_tinylfu"],
+    "rocksdb.multi_level_cache_lambda_exclude_compaction": "false",
+    "rocksdb.multi_level_cache_alpha_exclude_compaction": "true",
+    "rocksdb.multi_level_cache_use_reuse_lambda": "false",
+}
+# Reuse diagnostic: the working compensation config (cfgB_fullexc) plus HLL
+# tracking (scale unchanged). Run with MLC_WSS_DIAG=1 to log per-level
+# fg_lookups / fg_hits / distinct / reuse_ratio each round, to understand why
+# high-traffic deep levels have near-zero cacheable reuse before designing a
+# reuse-channel lambda fix.
+SCHEMES["mlc_tinylfu_cfgB_wsdiag"] = {
+    **SCHEMES["mlc_hcc_all_levels_sharded_tinylfu"],
+    "rocksdb.multi_level_cache_lambda_exclude_compaction": "true",
+    "rocksdb.multi_level_cache_alpha_exclude_compaction": "true",
+    "rocksdb.multi_level_cache_track_working_set": "true",
+}
+# Reuse-channel model fix: config B with lambda = reusable access rate
+# (fg_lookups - distinct) instead of raw lookups. Starves no-reuse deep levels
+# from the model itself (a_i = lambda*alpha/D -> 0), keeping D physical. The
+# theoretically-clean alternative to the QuantizeToBudget compensation.
+SCHEMES["mlc_tinylfu_cfgB_reuse"] = {
+    **SCHEMES["mlc_hcc_all_levels_sharded_tinylfu"],
+    "rocksdb.multi_level_cache_lambda_exclude_compaction": "true",
+    "rocksdb.multi_level_cache_alpha_exclude_compaction": "true",
+    "rocksdb.multi_level_cache_use_reuse_lambda": "true",
+}
+# Gate-redundancy isolation on top of reuse-lambda. The earlier combined
+# experiment (both gates off, gated config C) regressed to >41min because it
+# confounded two orthogonal pathologies. With reuse-lambda the deep levels are
+# starved by the model itself (lambda -> 0), so the ill-conditioning guard
+# *should* now be redundant. Test each gate in isolation:
+#   _noillguard: drop the ill-cond guard only. Expect no change (reuse-lambda
+#                already zeroes deep-level lambda, so the solver never funds
+#                L5/L6 regardless of the guard).
+#   _nostab:     drop the model-stability gate only. Hypothesis: still
+#                regresses -- reuse-lambda does NOT address per-round target
+#                swing on the funded shallow levels, so PurgeToCapacity churn
+#                (the original P2 pathology) returns.
+SCHEMES["mlc_tinylfu_cfgB_reuse_noillguard"] = {
+    **SCHEMES["mlc_tinylfu_cfgB_reuse"],
+    "rocksdb.multi_level_cache_ill_conditioning_guard": "false",
+}
+SCHEMES["mlc_tinylfu_cfgB_reuse_nostab"] = {
+    **SCHEMES["mlc_tinylfu_cfgB_reuse"],
+    "rocksdb.multi_level_cache_model_stability_threshold": "0",
 }
 
 # Data-share-weighted anti-starvation floor (KNOWN_ISSUES: MLC allocator
@@ -278,6 +368,34 @@ for _name, _props in SCHEMES.items():
     if _name.startswith("mlc_"):
         _props.setdefault(
             "rocksdb.multi_level_cache_min_active_level_capacity_ratio", "0.05")
+
+# Finalized MLC modeling default: config B (compaction fully excluded from both
+# the lambda and alpha channels) + reuse-lambda (lambda_i = max(eps, fg_lookups_i
+# - distinct_i), which starves no-reuse deep levels from the model itself so the
+# grow-only AutoHCC tables never balloon into the sparse-Evict collapse) + HLL
+# working-set sampling (sample_shift=2, recovers most of the reuse-tracking hot-
+# path cost with no precision loss). Validated on wlA 100M: 24.78 kops / hit
+# 0.125 / L5,L6 cap=0, tables stay tiny. The compensation QuantizeToBudget fix
+# and both gates (ill_conditioning_guard, model_stability_threshold) are always-
+# on in the binary and complement this. Applied via setdefault to every PRODUCT
+# MLC scheme; the deliberate A/B/C/D + working-set + gate-isolation experiment
+# variants (which pin their own toggles) are excluded so comparisons stay intact.
+_FINALIZED_MLC_PROPS = {
+    "rocksdb.multi_level_cache_lambda_exclude_compaction": "true",
+    "rocksdb.multi_level_cache_alpha_exclude_compaction": "true",
+    "rocksdb.multi_level_cache_use_reuse_lambda": "true",
+    "rocksdb.multi_level_cache_working_set_sample_shift": "2",
+}
+_MLC_EXPERIMENT_MARKERS = (
+    "cfg", "wss", "wsdiag", "relgate", "reuse", "deff", "nocap", "dbg",
+)
+for _name, _props in SCHEMES.items():
+    if not _name.startswith("mlc_"):
+        continue
+    if any(_m in _name.lower() for _m in _MLC_EXPERIMENT_MARKERS):
+        continue
+    for _k, _v in _FINALIZED_MLC_PROPS.items():
+        _props.setdefault(_k, _v)
 
 COMMON_PROPS = {
     "workload": "com.yahoo.ycsb.workloads.CoreWorkload",
