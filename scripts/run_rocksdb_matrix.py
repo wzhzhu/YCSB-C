@@ -956,6 +956,12 @@ def run_once(
         "cache_hit": f"{metrics.get('cache_hit', 0.0):.0f}",
         "cache_miss": f"{metrics.get('cache_miss', 0.0):.0f}",
         "cache_hit_ratio": f"{effective_hit_ratio:.6f}",
+        # Foreground-only (compaction-excluded) block-cache hit ratio, emitted
+        # uniformly for every scheme. cache_hit_ratio above is diluted by
+        # streaming compaction reads; this is the fair "query value" hit ratio.
+        "cache_fg_hit": f"{metrics.get('cache_fg_hit', 0.0):.0f}",
+        "cache_fg_miss": f"{metrics.get('cache_fg_miss', 0.0):.0f}",
+        "cache_fg_hit_ratio": f"{metrics.get('cache_fg_hit_ratio', 0.0):.6f}",
         "cache_data_hit_ratio": f"{metrics.get('cache_data_hit_ratio', 0.0):.6f}",
         "cache_filter_hit_ratio": f"{metrics.get('cache_filter_hit_ratio', 0.0):.6f}",
         "cache_index_hit_ratio": f"{metrics.get('cache_index_hit_ratio', 0.0):.6f}",
@@ -1025,8 +1031,9 @@ def emit_markdown(rows: List[Dict[str, str]], out_path: pathlib.Path) -> None:
         "| workload | scheme | cache(GB) | threads | shard_bits | "
         "read_attempt(Kops/s) | "
         "read_success(Kops/s) | write_attempt(Kops/s) | write_success(Kops/s) | "
-        "hit_ratio | data_hit_ratio | filter_hit_ratio | index_hit_ratio |\n"
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        "hit_ratio | fg_hit_ratio | data_hit_ratio | filter_hit_ratio | "
+        "index_hit_ratio |\n"
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
     )
     lines = [header]
     for r in rows:
@@ -1036,7 +1043,8 @@ def emit_markdown(rows: List[Dict[str, str]], out_path: pathlib.Path) -> None:
             f"{r['shard_bits']} | "
             f"{r['read_attempt_kops']} | {r['read_success_kops']} | "
             f"{r['write_attempt_kops']} | {r['write_success_kops']} | "
-            f"{r['cache_hit_ratio']} | {r['cache_data_hit_ratio']} | "
+            f"{r['cache_hit_ratio']} | {r.get('cache_fg_hit_ratio', '')} | "
+            f"{r['cache_data_hit_ratio']} | "
             f"{r['cache_filter_hit_ratio']} | {r['cache_index_hit_ratio']} |\n"
         )
     out_path.write_text("".join(lines), encoding="utf-8")

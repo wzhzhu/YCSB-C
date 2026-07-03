@@ -1124,6 +1124,25 @@ RocksdbDB::~RocksdbDB() {
     std::cerr << "rocksdb\tcache_miss\t" << misses << std::endl;
     std::cerr << "rocksdb\tcache_hit_ratio\t" << hit_ratio << std::endl;
 
+    // Foreground-only hit ratio: same block-cache events as above but with
+    // compaction-induced lookups excluded (see BLOCK_CACHE_FOREGROUND_* /
+    // MLCLookupIsCompaction). The overall cache_hit_ratio is diluted by
+    // streaming compaction reads that carry no foreground query value; this
+    // number is the compaction-free hit ratio and is emitted uniformly for
+    // every cache type (LRU / HyperClockCache / MultiLevelCache).
+    const uint64_t fg_hits =
+        statistics_->getTickerCount(rocksdb::BLOCK_CACHE_FOREGROUND_HIT);
+    const uint64_t fg_misses =
+        statistics_->getTickerCount(rocksdb::BLOCK_CACHE_FOREGROUND_MISS);
+    const uint64_t fg_total = fg_hits + fg_misses;
+    const double fg_hit_ratio =
+        fg_total > 0
+            ? (static_cast<double>(fg_hits) / static_cast<double>(fg_total))
+            : 0.0;
+    std::cerr << "rocksdb\tcache_fg_hit\t" << fg_hits << std::endl;
+    std::cerr << "rocksdb\tcache_fg_miss\t" << fg_misses << std::endl;
+    std::cerr << "rocksdb\tcache_fg_hit_ratio\t" << fg_hit_ratio << std::endl;
+
     const auto emit_typed_ratio = [&](const char* name,
                                       rocksdb::Tickers hit_ticker,
                                       rocksdb::Tickers miss_ticker) {
