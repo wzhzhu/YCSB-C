@@ -1167,6 +1167,28 @@ RocksdbDB::~RocksdbDB() {
                      rocksdb::BLOCK_CACHE_FILTER_MISS);
     emit_typed_ratio("index", rocksdb::BLOCK_CACHE_INDEX_HIT,
                      rocksdb::BLOCK_CACHE_INDEX_MISS);
+
+    // Per-operation latency percentiles (microseconds) from RocksDB's own
+    // DB_GET / DB_WRITE histograms. These are recorded at the default stats
+    // level with no added per-op cost, and statistics_ was Reset() right before
+    // the transaction phase, so they reflect only measured transactions. Tail
+    // latency (p99/max) is the metric where a higher cache hit ratio pays off
+    // most visibly even when mean throughput is I/O-bound: a hit is served from
+    // memory while a miss pays the NVMe + kernel-queue tail.
+    const auto emit_latency = [&](const char* name, rocksdb::Histograms hist) {
+      rocksdb::HistogramData h;
+      statistics_->histogramData(hist, &h);
+      std::cerr << "rocksdb\t" << name << "_count\t" << h.count << std::endl;
+      std::cerr << "rocksdb\t" << name << "_us_mean\t" << h.average << std::endl;
+      std::cerr << "rocksdb\t" << name << "_us_p50\t" << h.median << std::endl;
+      std::cerr << "rocksdb\t" << name << "_us_p95\t" << h.percentile95
+                << std::endl;
+      std::cerr << "rocksdb\t" << name << "_us_p99\t" << h.percentile99
+                << std::endl;
+      std::cerr << "rocksdb\t" << name << "_us_max\t" << h.max << std::endl;
+    };
+    emit_latency("lat_get", rocksdb::DB_GET);
+    emit_latency("lat_write", rocksdb::DB_WRITE);
   }
   std::cerr << "rocksdb\tinsert_get_ok\t" << insert_get_ok_count_ << std::endl;
   std::cerr << "rocksdb\tinsert_get_not_found\t" << insert_get_not_found_count_

@@ -953,6 +953,19 @@ def run_once(
         "write_success_kops": f"{write_success_kops:.6f}",
         "read_avg_latency_ms": f"{to_latency_ms(read_success_kops):.6f}",
         "write_avg_latency_ms": f"{to_latency_ms(write_success_kops):.6f}",
+        # RocksDB DB_GET/DB_WRITE latency percentiles (microseconds), transaction
+        # phase only. Tail (p99/max) is where a higher hit ratio shows up even
+        # when mean throughput is I/O-bound.
+        "lat_get_us_p50": f"{metrics.get('lat_get_us_p50', 0.0):.3f}",
+        "lat_get_us_p95": f"{metrics.get('lat_get_us_p95', 0.0):.3f}",
+        "lat_get_us_p99": f"{metrics.get('lat_get_us_p99', 0.0):.3f}",
+        "lat_get_us_max": f"{metrics.get('lat_get_us_max', 0.0):.3f}",
+        "lat_get_us_mean": f"{metrics.get('lat_get_us_mean', 0.0):.3f}",
+        "lat_write_us_p50": f"{metrics.get('lat_write_us_p50', 0.0):.3f}",
+        "lat_write_us_p95": f"{metrics.get('lat_write_us_p95', 0.0):.3f}",
+        "lat_write_us_p99": f"{metrics.get('lat_write_us_p99', 0.0):.3f}",
+        "lat_write_us_max": f"{metrics.get('lat_write_us_max', 0.0):.3f}",
+        "lat_write_us_mean": f"{metrics.get('lat_write_us_mean', 0.0):.3f}",
         "cache_hit": f"{metrics.get('cache_hit', 0.0):.0f}",
         "cache_miss": f"{metrics.get('cache_miss', 0.0):.0f}",
         "cache_hit_ratio": f"{effective_hit_ratio:.6f}",
@@ -1031,9 +1044,9 @@ def emit_markdown(rows: List[Dict[str, str]], out_path: pathlib.Path) -> None:
         "| workload | scheme | cache(GB) | threads | shard_bits | "
         "read_attempt(Kops/s) | "
         "read_success(Kops/s) | write_attempt(Kops/s) | write_success(Kops/s) | "
-        "hit_ratio | fg_hit_ratio | data_hit_ratio | filter_hit_ratio | "
-        "index_hit_ratio |\n"
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        "hit_ratio | fg_hit_ratio | get_p99(us) | data_hit_ratio | "
+        "filter_hit_ratio | index_hit_ratio |\n"
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
     )
     lines = [header]
     for r in rows:
@@ -1044,6 +1057,7 @@ def emit_markdown(rows: List[Dict[str, str]], out_path: pathlib.Path) -> None:
             f"{r['read_attempt_kops']} | {r['read_success_kops']} | "
             f"{r['write_attempt_kops']} | {r['write_success_kops']} | "
             f"{r['cache_hit_ratio']} | {r.get('cache_fg_hit_ratio', '')} | "
+            f"{r.get('lat_get_us_p99', '')} | "
             f"{r['cache_data_hit_ratio']} | "
             f"{r['cache_filter_hit_ratio']} | {r['cache_index_hit_ratio']} |\n"
         )
