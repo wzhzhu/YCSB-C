@@ -545,6 +545,12 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.interval_ms = static_cast<uint64_t>(
         std::max(1, ParseInt(props, "rocksdb.multi_level_cache_adjust_interval_ms",
                              5000)));
+    // Op-count adjustment cadence (lookups per round). Decouples the number of
+    // solve/apply rounds from thread count / throughput so the converged
+    // allocation (and hit ratio) no longer drifts with concurrency. 0 falls
+    // back to the wall-clock interval_ms cadence.
+    alloc_opts.adjust_interval_ops = ParseUint64(
+        props, "rocksdb.multi_level_cache_adjust_interval_ops", 100000ULL);
     alloc_opts.smoothing_ratio =
         ParseDouble(props, "rocksdb.multi_level_cache_adjust_smoothing_ratio",
                     0.5);

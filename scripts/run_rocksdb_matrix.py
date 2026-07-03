@@ -179,6 +179,10 @@ SCHEMES = {
         "rocksdb.multi_level_cache_auto_adjust": "true",
         "rocksdb.multi_level_cache_allocator_mode": "model",
         "rocksdb.multi_level_cache_adjust_interval_ms": "3600000",
+        # Disable op-count gating so this arm keeps its pure wall-clock "run
+        # once then never again" semantics (otherwise the 100K-op default would
+        # make it adjust continuously, defeating the diagnostic).
+        "rocksdb.multi_level_cache_adjust_interval_ops": "0",
         "rocksdb.multi_level_cache_alpha_estimator": "robust_hit_rate",
         "rocksdb.cache_numshardbits": "6",
         "rocksdb.multi_level_cache_shard_bottom_only": "true",
@@ -385,6 +389,10 @@ _FINALIZED_MLC_PROPS = {
     "rocksdb.multi_level_cache_alpha_exclude_compaction": "true",
     "rocksdb.multi_level_cache_use_reuse_lambda": "true",
     "rocksdb.multi_level_cache_working_set_sample_shift": "2",
+    # Op-count adjustment cadence (100K lookups/round) instead of the 5s wall
+    # clock, so the number of solve rounds -- and thus the converged allocation
+    # and hit ratio -- no longer drifts non-monotonically with thread count.
+    "rocksdb.multi_level_cache_adjust_interval_ops": "100000",
 }
 _MLC_EXPERIMENT_MARKERS = (
     "cfg", "wss", "wsdiag", "relgate", "reuse", "deff", "nocap", "dbg",
