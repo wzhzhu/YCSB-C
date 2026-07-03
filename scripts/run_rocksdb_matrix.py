@@ -358,6 +358,17 @@ SCHEMES["mlc_tinylfu_cfgB_reuse_nostab"] = {
     "rocksdb.multi_level_cache_model_stability_threshold": "0",
 }
 
+# A/B twin of mlc_hcc_all_levels with capacity-gated insertion DISABLED
+# (bypass=0). Pinned explicitly so the _FINALIZED_MLC_PROPS setdefault below
+# does not re-enable it; every other finalized default is still inherited, so a
+# paired run against mlc_hcc_all_levels (bypass=4 MiB) isolates the deep-level
+# insert-bypass effect on Evict churn / throughput. The name matches no
+# experiment marker, so it still receives the finalized modeling defaults.
+SCHEMES["mlc_hcc_all_levels_nobypass"] = {
+    **SCHEMES["mlc_hcc_all_levels"],
+    "rocksdb.multi_level_cache_insert_bypass_capacity_bytes": "0",
+}
+
 # Data-share-weighted anti-starvation floor (KNOWN_ISSUES: MLC allocator
 # deep-level starvation -> compaction stall -> write stall under sustained
 # write load). Default the floor pool to 5% of the total cache budget for
@@ -393,6 +404,15 @@ _FINALIZED_MLC_PROPS = {
     # clock, so the number of solve rounds -- and thus the converged allocation
     # and hit ratio -- no longer drifts non-monotonically with thread count.
     "rocksdb.multi_level_cache_adjust_interval_ops": "100000",
+    # Capacity-gated insertion (4 MiB floor). A level the reuse-lambda allocator
+    # starves below this (e.g. the deep L5/L6 which carry ~99% of the data but
+    # near-zero foreground reuse) caches nothing durably -- every insert is
+    # evicted immediately -- so a real insert is pure churn (grow-only AutoHCC
+    # table -> sparse Evict sweep, the profiled ~2.5% deep-level CPU delta vs the
+    # HCC baseline). Bypass the table there and return an uncharged standalone
+    # entry instead: the caller still gets a usable pinned block, hit ratio is
+    # unchanged (already ~0 on those levels), and the Evict hotspot disappears.
+    "rocksdb.multi_level_cache_insert_bypass_capacity_bytes": "4194304",
 }
 _MLC_EXPERIMENT_MARKERS = (
     "cfg", "wss", "wsdiag", "relgate", "reuse", "deff", "nocap", "dbg",

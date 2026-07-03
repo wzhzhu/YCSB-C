@@ -172,6 +172,14 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
   const uint32_t cache_hash_seed =
       static_cast<uint32_t>(ParseUint64(props, "rocksdb.cache_hash_seed", 0));
 
+  // Common MLC runtime settings applied to every constructed variant.
+  auto apply_mlc_common = [&props](rocksdb::MultiLevelCache& cache) {
+    cache.SetSharedPoolRatio(
+        ParseDouble(props, "rocksdb.multi_level_cache_shared_pool_ratio", 0.0));
+    cache.SetInsertBypassCapacity(static_cast<size_t>(ParseUint64(
+        props, "rocksdb.multi_level_cache_insert_bypass_capacity_bytes", 0)));
+  };
+
   if (cache_type == "lru_cache") {
     rocksdb::LRUCacheOptions lru_opts(
         cache_capacity, cache_numshardbits, strict_capacity_limit,
@@ -180,8 +188,7 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
     lru_opts.hash_seed = cache_hash_seed;
     auto cache = std::make_shared<rocksdb::MultiLevelCache>(
         static_cast<size_t>(num_levels), cache_capacity, lru_opts, force_l0);
-    cache->SetSharedPoolRatio(
-        ParseDouble(props, "rocksdb.multi_level_cache_shared_pool_ratio", 0.0));
+    apply_mlc_common(*cache);
     if (out_multi_level_cache != nullptr) {
       *out_multi_level_cache = cache;
     }
@@ -206,8 +213,7 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
     auto cache = std::make_shared<rocksdb::MultiLevelCache>(
         static_cast<size_t>(num_levels), cache_capacity,
         std::move(sub_cache_factory), force_l0);
-    cache->SetSharedPoolRatio(
-        ParseDouble(props, "rocksdb.multi_level_cache_shared_pool_ratio", 0.0));
+    apply_mlc_common(*cache);
     if (out_multi_level_cache != nullptr) {
       *out_multi_level_cache = cache;
     }
@@ -232,8 +238,7 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
     auto cache = std::make_shared<rocksdb::MultiLevelCache>(
         static_cast<size_t>(num_levels), cache_capacity,
         std::move(sub_cache_factory), force_l0);
-    cache->SetSharedPoolRatio(
-        ParseDouble(props, "rocksdb.multi_level_cache_shared_pool_ratio", 0.0));
+    apply_mlc_common(*cache);
     if (out_multi_level_cache != nullptr) {
       *out_multi_level_cache = cache;
     }
@@ -298,8 +303,7 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
     if (!mixed_srhcc && !mixed_fixed && !shard_bottom_only) {
       auto cache = std::make_shared<rocksdb::MultiLevelCache>(
           static_cast<size_t>(num_levels), cache_capacity, hcc_opts, force_l0);
-      cache->SetSharedPoolRatio(
-          ParseDouble(props, "rocksdb.multi_level_cache_shared_pool_ratio", 0.0));
+      apply_mlc_common(*cache);
       if (out_multi_level_cache != nullptr) {
         *out_multi_level_cache = cache;
       }
@@ -348,8 +352,7 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
     shared_cache->SetCapacity(0);
     auto cache = std::make_shared<rocksdb::MultiLevelCache>(
         std::move(sub_caches), std::move(shared_cache), cache_capacity);
-    cache->SetSharedPoolRatio(
-        ParseDouble(props, "rocksdb.multi_level_cache_shared_pool_ratio", 0.0));
+    apply_mlc_common(*cache);
     if (out_multi_level_cache != nullptr) {
       *out_multi_level_cache = cache;
     }
