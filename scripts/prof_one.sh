@@ -6,7 +6,7 @@
 # ycsbc process for DURATION seconds with perf, then stops the run. Produces a
 # perf.data plus a --no-children (self%) and a children (cumulative) report.
 #
-# Usage: prof_one.sh <scheme> <threads> <warmup_s> <duration_s> <tag>
+# Usage: prof_one.sh <scheme> <threads> <warmup_s> <duration_s> <tag> [cache_gb]
 set -u
 
 SCHEME="${1:?scheme}"
@@ -14,6 +14,7 @@ THREADS="${2:-8}"
 WARMUP="${3:-70}"
 DURATION="${4:-90}"
 TAG="${5:-$SCHEME}"
+CACHE_GB="${6:-1}"
 
 YCSB=/users/wzhzhu/YCSB-C-master
 OUTDIR=/users/wzhzhu/YCSB-C-master/results/prof-bypass-0703
@@ -26,7 +27,7 @@ cd "$YCSB" || exit 1
 echo "[prof] launching scheme=$SCHEME threads=$THREADS"
 # 200M ops so the transaction phase far outlasts warmup+sampling; we kill it.
 setsid python3 scripts/run_rocksdb_matrix.py \
-  --workloads A --schemes "$SCHEME" --threads "$THREADS" --cache-gb 1 \
+  --workloads A --schemes "$SCHEME" --threads "$THREADS" --cache-gb "$CACHE_GB" \
   --operationcount 200000000 --refill-policy clone_per_case \
   --run-id "prof-$TAG" --db-run-id wlABCDEF-0618 \
   --results-dir "$OUTDIR/matrix-$TAG" >"$RUNLOG" 2>&1 &

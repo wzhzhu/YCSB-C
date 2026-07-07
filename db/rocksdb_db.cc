@@ -315,6 +315,10 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
     const size_t remainder = force_l0 ? 0 : (cache_capacity % level_count);
     std::vector<std::shared_ptr<rocksdb::Cache>> sub_caches;
     sub_caches.reserve(level_count);
+    // Per-level options retained for the sparse-table rebuild factory below
+    // (each level may differ in shard bits / probation / entry charge).
+    std::vector<rocksdb::HyperClockCacheOptions> per_level_opts;
+    per_level_opts.reserve(level_count);
     for (size_t level = 0; level < level_count; ++level) {
       size_t level_capacity = per_level_capacity + (level < remainder ? 1 : 0);
       if (force_l0 && level == 0) {
@@ -345,6 +349,7 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
       auto sub = per_level.MakeSharedCache();
       sub->SetCapacity(level_capacity);
       sub_caches.emplace_back(std::move(sub));
+      per_level_opts.push_back(per_level);
     }
     rocksdb::HyperClockCacheOptions shared_opts = hcc_opts;
     shared_opts.capacity = std::max<size_t>(1, cache_capacity);
@@ -352,6 +357,23 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
     shared_cache->SetCapacity(0);
     auto cache = std::make_shared<rocksdb::MultiLevelCache>(
         std::move(sub_caches), std::move(shared_cache), cache_capacity);
+    // The vector<Cache> constructor cannot install the sparse-table rebuild
+    // factory itself (it doesn't know how the sub-caches were built). Without
+    // it, a level whose AutoHCC table grew while funded and was then defunded
+    // keeps its grow-only slot array forever, and every Evict sweeps the
+    // mostly-empty table (profiled at >50% of total cycles at a 1 GiB budget).
+    cache->SetRebuildSubCacheFactory(
+        [per_level_opts](size_t level, size_t new_capacity)
+            -> std::shared_ptr<rocksdb::Cache> {
+          if (level >= per_level_opts.size()) {
+            return nullptr;
+          }
+          // Same construction as above: mmap reserved for the whole budget,
+          // then shrink to the current target capacity.
+          auto fresh = per_level_opts[level].MakeSharedCache();
+          fresh->SetCapacity(new_capacity);
+          return fresh;
+        });
     apply_mlc_common(*cache);
     if (out_multi_level_cache != nullptr) {
       *out_multi_level_cache = cache;
@@ -568,6 +590,29 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.step_min_score_ratio = ParseDouble(
         props, "rocksdb.multi_level_cache_adjust_step_min_score_ratio",
         alloc_opts.step_min_score_ratio);
+    // Adaptive step acceleration: step doubles while consecutive applied
+    // rounds pick the same recipient (up to step_max), resets to the base
+    // step on direction change or skip. step_growth <= 1.0 disables.
+    alloc_opts.step_max_bytes = static_cast<size_t>(ParseUint64(
+        props, "rocksdb.multi_level_cache_adjust_step_max_bytes",
+        static_cast<uint64_t>(alloc_opts.step_max_bytes)));
+    alloc_opts.step_growth = ParseDouble(
+        props, "rocksdb.multi_level_cache_adjust_step_growth",
+        alloc_opts.step_growth);
+    // Steady-state suppression: ghost-score EMA, ping-pong direction locks,
+    // and Poisson-significance transfer gating.
+    alloc_opts.ghost_score_ema_beta = ParseDouble(
+        props, "rocksdb.multi_level_cache_ghost_score_ema_beta",
+        alloc_opts.ghost_score_ema_beta);
+    alloc_opts.step_direction_lock_rounds = ParseUint64(
+        props, "rocksdb.multi_level_cache_step_direction_lock_rounds",
+        alloc_opts.step_direction_lock_rounds);
+    alloc_opts.ghost_min_recv_donor_ratio = ParseDouble(
+        props, "rocksdb.multi_level_cache_ghost_min_recv_donor_ratio",
+        alloc_opts.ghost_min_recv_donor_ratio);
+    alloc_opts.ghost_significance_k = ParseDouble(
+        props, "rocksdb.multi_level_cache_ghost_significance_k",
+        alloc_opts.ghost_significance_k);
     // Ghost (repeat-miss) marginal scoring for the incremental mode: replaces
     // the exponential-model score with a direct per-level measurement of
     // capacity-convertible miss traffic (repeat misses on recently-missed
@@ -580,6 +625,11 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
                       16)));
       multi_level_cache_->SetGhostTrackingEnabled(true, ghost_slots_log2);
     }
+    // Per-byte normalization of the ghost score (score = ghost_hits / D_i):
+    // restores the capacity-price-per-hit ordering the raw count lacks.
+    alloc_opts.ghost_normalize_by_data = ParseBool(
+        props, "rocksdb.multi_level_cache_ghost_normalize_by_data",
+        alloc_opts.ghost_normalize_by_data);
     alloc_opts.min_active_level_capacity_bytes = static_cast<size_t>(ParseUint64(
         props, "rocksdb.multi_level_cache_adjust_min_active_level_capacity_bytes",
         0));
@@ -1188,6 +1238,17 @@ RocksdbDB::~RocksdbDB() {
                      rocksdb::BLOCK_CACHE_FILTER_MISS);
     emit_typed_ratio("index", rocksdb::BLOCK_CACHE_INDEX_HIT,
                      rocksdb::BLOCK_CACHE_INDEX_MISS);
+
+    // Write-stall accounting: total microseconds writers spent blocked on
+    // compaction back-pressure during the transaction phase (statistics_ is
+    // Reset() before it). This is the channel through which the cache scheme
+    // affects the WRITE path in a 50/50 workload -- compaction speed ->
+    // L0/pending-bytes back-pressure -> stall -- and thus the metric that
+    // decides whether a throughput gap between schemes comes from the write
+    // side rather than from block-cache hit ratio.
+    std::cerr << "rocksdb\tstall_micros\t"
+              << statistics_->getTickerCount(rocksdb::STALL_MICROS)
+              << std::endl;
 
     // Per-operation latency percentiles (microseconds) from RocksDB's own
     // DB_GET / DB_WRITE histograms. These are recorded at the default stats

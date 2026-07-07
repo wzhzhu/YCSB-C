@@ -997,6 +997,10 @@ def run_once(
         "cache_filter_miss": f"{metrics.get('cache_filter_miss', 0.0):.0f}",
         "cache_index_hit": f"{metrics.get('cache_index_hit', 0.0):.0f}",
         "cache_index_miss": f"{metrics.get('cache_index_miss', 0.0):.0f}",
+        # Total microseconds writers spent blocked on compaction back-pressure
+        # (STALL_MICROS) during the transaction phase; the write-side channel
+        # through which the cache scheme affects throughput.
+        "stall_micros": f"{metrics.get('stall_micros', 0.0):.0f}",
         # RocksDB statistics (BLOCK_CACHE_HIT/MISS) view. For arc/cacheus this
         # is measured at the same wrapper boundary as wrapper_hit_ratio (the
         # backing cache is invisible to these tickers), NOT a backing-layer
