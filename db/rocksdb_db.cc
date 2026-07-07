@@ -559,6 +559,27 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
                     0.5);
     alloc_opts.min_total_change_bytes = static_cast<size_t>(ParseUint64(
         props, "rocksdb.multi_level_cache_adjust_min_change_bytes", 1ULL << 20));
+    // Incremental marginal-step mode: transfer this many bytes per round
+    // between the most over-provisioned and most under-provisioned level.
+    // 0 reverts to the legacy global water-filling solver.
+    alloc_opts.adjust_step_bytes = static_cast<size_t>(ParseUint64(
+        props, "rocksdb.multi_level_cache_adjust_step_bytes",
+        static_cast<uint64_t>(alloc_opts.adjust_step_bytes)));
+    alloc_opts.step_min_score_ratio = ParseDouble(
+        props, "rocksdb.multi_level_cache_adjust_step_min_score_ratio",
+        alloc_opts.step_min_score_ratio);
+    // Ghost (repeat-miss) marginal scoring for the incremental mode: replaces
+    // the exponential-model score with a direct per-level measurement of
+    // capacity-convertible miss traffic (repeat misses on recently-missed
+    // keys). See MultiLevelCache::SetGhostTrackingEnabled.
+    alloc_opts.use_ghost_marginal = ParseBool(
+        props, "rocksdb.multi_level_cache_use_ghost_marginal", false);
+    if (alloc_opts.use_ghost_marginal && multi_level_cache_ != nullptr) {
+      const uint32_t ghost_slots_log2 = static_cast<uint32_t>(std::max(
+          0, ParseInt(props, "rocksdb.multi_level_cache_ghost_slots_log2",
+                      16)));
+      multi_level_cache_->SetGhostTrackingEnabled(true, ghost_slots_log2);
+    }
     alloc_opts.min_active_level_capacity_bytes = static_cast<size_t>(ParseUint64(
         props, "rocksdb.multi_level_cache_adjust_min_active_level_capacity_bytes",
         0));

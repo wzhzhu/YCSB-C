@@ -398,8 +398,21 @@ for _name, _props in SCHEMES.items():
 _FINALIZED_MLC_PROPS = {
     "rocksdb.multi_level_cache_lambda_exclude_compaction": "true",
     "rocksdb.multi_level_cache_alpha_exclude_compaction": "true",
-    "rocksdb.multi_level_cache_use_reuse_lambda": "true",
-    "rocksdb.multi_level_cache_working_set_sample_shift": "2",
+    # use_reuse_lambda=false: lambda = raw fg_lookups per level (no distinct
+    # subtraction). The exponential MRC model already captures reuse through the
+    # observed miss rate (alpha); subtracting the HLL-tracked distinct footprint
+    # from the numerator was an add-on that made lambda_L6 -> 0 for large-dataset
+    # levels where every window sees mostly unique blocks, incorrectly starving them
+    # from the model and reversing the a_i = lambda*alpha/D score ordering.
+    "rocksdb.multi_level_cache_use_reuse_lambda": "false",
+    # Ghost (repeat-miss) marginal scoring for the incremental allocator:
+    # per-level repeat misses on recently-missed keys = direct, model-free
+    # measurement of the miss traffic that +capacity would convert into hits.
+    # Replaces the exponential-model score, whose single-point alpha inversion
+    # degenerates to lambda*m*(-ln m)/c (a "medium-miss-rate seeker" that
+    # deprioritizes both starved and saturated levels regardless of their true
+    # MRC).
+    "rocksdb.multi_level_cache_use_ghost_marginal": "true",
     # Op-count adjustment cadence (100K lookups/round) instead of the 5s wall
     # clock, so the number of solve rounds -- and thus the converged allocation
     # and hit ratio -- no longer drifts non-monotonically with thread count.
