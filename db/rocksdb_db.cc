@@ -1305,6 +1305,10 @@ RocksdbDB::~RocksdbDB() {
     };
     emit_latency("lat_get", rocksdb::DB_GET);
     emit_latency("lat_write", rocksdb::DB_WRITE);
+    // Whole-scan latency (Seek + Nexts + decode), recorded client-side in
+    // Scan() into the otherwise-unused DB_MULTIGET slot. Zero count on
+    // non-scan workloads.
+    emit_latency("lat_scan", rocksdb::DB_MULTIGET);
   }
   std::cerr << "rocksdb\tinsert_get_ok\t" << insert_get_ok_count_ << std::endl;
   std::cerr << "rocksdb\tinsert_get_not_found\t" << insert_get_not_found_count_
@@ -1543,6 +1547,14 @@ int RocksdbDB::Scan(const std::string& table, const std::string& key,
     return DB::kErrorConflict;
   }
 
+  // Whole-scan latency (Seek + all Nexts + decode), recorded into the
+  // DB_MULTIGET histogram slot: this workload never calls MultiGet, so the
+  // slot is otherwise empty, and reusing it inherits the existing
+  // stats-reset / percentile-export plumbing (emitted as lat_scan_*).
+  // RocksDB's own DB_SEEK histogram only times the Seek call, which is a
+  // small fraction of a multi-record scan's cost.
+  const auto scan_start = std::chrono::steady_clock::now();
+
   const std::string table_prefix = table;
   const std::string start_key =
       BuildInternalKey(table, key, raw_kv_mode_, raw_key_size_bytes_);
@@ -1574,6 +1586,13 @@ int RocksdbDB::Scan(const std::string& table, const std::string& key,
     iter->Next();
   }
 
+  if (statistics_) {
+    const uint64_t micros =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - scan_start)
+            .count();
+    statistics_->recordInHistogram(rocksdb::DB_MULTIGET, micros);
+  }
   if (!iter->status().ok()) {
     return DB::kErrorConflict;
   }

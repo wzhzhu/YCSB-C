@@ -992,6 +992,13 @@ def run_once(
         "lat_write_us_p95": f"{metrics.get('lat_write_us_p95', 0.0):.3f}",
         "lat_write_us_p99": f"{metrics.get('lat_write_us_p99', 0.0):.3f}",
         "lat_write_us_max": f"{metrics.get('lat_write_us_max', 0.0):.3f}",
+        # Whole-scan latency (workload E; zero elsewhere), client-recorded in
+        # RocksdbDB::Scan via the DB_MULTIGET histogram slot.
+        "lat_scan_us_p50": f"{metrics.get('lat_scan_us_p50', 0.0):.3f}",
+        "lat_scan_us_p95": f"{metrics.get('lat_scan_us_p95', 0.0):.3f}",
+        "lat_scan_us_p99": f"{metrics.get('lat_scan_us_p99', 0.0):.3f}",
+        "lat_scan_us_max": f"{metrics.get('lat_scan_us_max', 0.0):.3f}",
+        "lat_scan_us_mean": f"{metrics.get('lat_scan_us_mean', 0.0):.3f}",
         "lat_write_us_mean": f"{metrics.get('lat_write_us_mean', 0.0):.3f}",
         "cache_hit": f"{metrics.get('cache_hit', 0.0):.0f}",
         "cache_miss": f"{metrics.get('cache_miss', 0.0):.0f}",
