@@ -643,11 +643,21 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     // keys). See MultiLevelCache::SetGhostTrackingEnabled.
     alloc_opts.use_ghost_marginal = ParseBool(
         props, "rocksdb.multi_level_cache_use_ghost_marginal", false);
+    // Capture-rate scoring (segmented ghost): reuse-distance histogram of
+    // repeat misses replaces the static per-byte denominators.
+    alloc_opts.use_ghost_capture_rate = ParseBool(
+        props, "rocksdb.multi_level_cache_use_ghost_capture_rate",
+        alloc_opts.use_ghost_capture_rate);
+    alloc_opts.ghost_dist_block_bytes = static_cast<size_t>(std::max(
+        1, ParseInt(props, "rocksdb.multi_level_cache_ghost_dist_block_bytes",
+                    static_cast<int>(alloc_opts.ghost_dist_block_bytes))));
     if (alloc_opts.use_ghost_marginal && multi_level_cache_ != nullptr) {
       const uint32_t ghost_slots_log2 = static_cast<uint32_t>(std::max(
           0, ParseInt(props, "rocksdb.multi_level_cache_ghost_slots_log2",
                       16)));
-      multi_level_cache_->SetGhostTrackingEnabled(true, ghost_slots_log2);
+      multi_level_cache_->SetGhostTrackingEnabled(
+          true, ghost_slots_log2,
+          /*segmented=*/alloc_opts.use_ghost_capture_rate);
     }
     // Per-byte normalization of the ghost score (score = ghost_hits / D_i):
     // restores the capacity-price-per-hit ordering the raw count lacks.
