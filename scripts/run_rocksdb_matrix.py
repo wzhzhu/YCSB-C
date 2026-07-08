@@ -413,6 +413,11 @@ _FINALIZED_MLC_PROPS = {
     # deprioritizes both starved and saturated levels regardless of their true
     # MRC).
     "rocksdb.multi_level_cache_use_ghost_marginal": "true",
+    # 2^18 fingerprint slots per level (2 MiB x 7 levels). At 2^16 the
+    # direct-mapped ghost table saturates for high-traffic levels (L6 sees
+    # ~18M lookups per window at 2 GiB), colliding away repeat-miss evidence
+    # and systematically under-funding the largest levels.
+    "rocksdb.multi_level_cache_ghost_slots_log2": "18",
     # Op-count adjustment cadence (100K lookups/round) instead of the 5s wall
     # clock, so the number of solve rounds -- and thus the converged allocation
     # and hit ratio -- no longer drifts non-monotonically with thread count.

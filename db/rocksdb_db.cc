@@ -613,6 +613,21 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.ghost_significance_k = ParseDouble(
         props, "rocksdb.multi_level_cache_ghost_significance_k",
         alloc_opts.ghost_significance_k);
+    alloc_opts.probe_after_skipped_rounds = static_cast<uint64_t>(std::max(
+        0, ParseInt(props, "rocksdb.multi_level_cache_probe_after_skipped_rounds",
+                    static_cast<int>(alloc_opts.probe_after_skipped_rounds))));
+    alloc_opts.probe_step_divisor = static_cast<size_t>(std::max(
+        1, ParseInt(props, "rocksdb.multi_level_cache_probe_step_divisor",
+                    static_cast<int>(alloc_opts.probe_step_divisor))));
+    alloc_opts.reversal_window_rounds = static_cast<uint64_t>(std::max(
+        0, ParseInt(props, "rocksdb.multi_level_cache_reversal_window_rounds",
+                    static_cast<int>(alloc_opts.reversal_window_rounds))));
+    alloc_opts.reversal_lock_max_rounds = static_cast<uint64_t>(std::max(
+        0, ParseInt(props, "rocksdb.multi_level_cache_reversal_lock_max_rounds",
+                    static_cast<int>(alloc_opts.reversal_lock_max_rounds))));
+    alloc_opts.ghost_uncached_floor_frac = ParseDouble(
+        props, "rocksdb.multi_level_cache_ghost_uncached_floor_frac",
+        alloc_opts.ghost_uncached_floor_frac);
     // Ghost (repeat-miss) marginal scoring for the incremental mode: replaces
     // the exponential-model score with a direct per-level measurement of
     // capacity-convertible miss traffic (repeat misses on recently-missed
