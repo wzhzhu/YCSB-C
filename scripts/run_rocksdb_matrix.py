@@ -418,6 +418,15 @@ _FINALIZED_MLC_PROPS = {
     # ~18M lookups per window at 2 GiB), colliding away repeat-miss evidence
     # and systematically under-funding the largest levels.
     "rocksdb.multi_level_cache_ghost_slots_log2": "18",
+    # Segmented ghost (capture-rate) scoring: each ghost slot carries the
+    # level's sampled distinct-miss clock, repeat misses are binned by reuse
+    # distance, and the score integrates hist[b]/(mid_b * block_bytes) --
+    # a measured per-byte marginal utility that replaces the static /D
+    # normalization (which flat-taxed concentrated deep-level reuse) and has
+    # no feedback through the current allocation. Verified on wlA 100M 2 GiB:
+    # fg hit t64 0.1904 / t128 0.1888 vs lean /D 0.1798 / 0.1803 (HCC 0.1876
+    # / 0.1812), repeat spread halved, throughput +24% / +8% over HCC.
+    "rocksdb.multi_level_cache_use_ghost_capture_rate": "true",
     # Op-count adjustment cadence (100K lookups/round) instead of the 5s wall
     # clock, so the number of solve rounds -- and thus the converged allocation
     # and hit ratio -- no longer drifts non-monotonically with thread count.
