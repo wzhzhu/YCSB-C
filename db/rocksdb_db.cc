@@ -628,6 +628,15 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.ghost_uncached_floor_frac = ParseDouble(
         props, "rocksdb.multi_level_cache_ghost_uncached_floor_frac",
         alloc_opts.ghost_uncached_floor_frac);
+    alloc_opts.ghost_normalize_by_uncached = ParseBool(
+        props, "rocksdb.multi_level_cache_ghost_normalize_by_uncached",
+        alloc_opts.ghost_normalize_by_uncached);
+    alloc_opts.accel_cold_start_applies = static_cast<uint64_t>(std::max(
+        0, ParseInt(props, "rocksdb.multi_level_cache_accel_cold_start_applies",
+                    static_cast<int>(alloc_opts.accel_cold_start_applies))));
+    alloc_opts.data_ema_beta = ParseDouble(
+        props, "rocksdb.multi_level_cache_data_ema_beta",
+        alloc_opts.data_ema_beta);
     // Ghost (repeat-miss) marginal scoring for the incremental mode: replaces
     // the exponential-model score with a direct per-level measurement of
     // capacity-convertible miss traffic (repeat misses on recently-missed
