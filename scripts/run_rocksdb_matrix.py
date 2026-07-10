@@ -620,7 +620,45 @@ def parse_args() -> argparse.Namespace:
         "Overrides COMMON_PROPS but is overridden by per-scheme props.",
     )
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--fstrim-per-cell",
+        action="store_true",
+        help="Run fstrim on --fstrim-path after every cache-by-threads cell "
+        "(all schemes for one workload/cache/threads tuple). Keeps SSD "
+        "internal state uniform across compared schemes within a cell.",
+    )
+    p.add_argument(
+        "--fstrim-path",
+        default="/mnt/rocksdb_nvme",
+        help="Mount point to trim when --fstrim-per-cell is set.",
+    )
     return p.parse_args()
+
+
+def fstrim_mount(mount_path: str) -> None:
+    """Best-effort TRIM after a matrix cell; failures are logged, not fatal."""
+    try:
+        proc = subprocess.run(
+            ["sudo", "fstrim", mount_path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0:
+            detail = (proc.stdout or proc.stderr or "").strip()
+            print(
+                f"[INFO] fstrim {mount_path} ok"
+                + (f" ({detail})" if detail else ""),
+                flush=True,
+            )
+        else:
+            err = (proc.stderr or proc.stdout or "").strip()
+            print(
+                f"[WARN] fstrim {mount_path} failed (rc={proc.returncode}): {err}",
+                file=sys.stderr,
+            )
+    except OSError as exc:
+        print(f"[WARN] fstrim {mount_path} failed: {exc}", file=sys.stderr)
 
 
 def load_spec(path: pathlib.Path) -> Dict[str, str]:
@@ -1169,9 +1207,9 @@ def main() -> int:
 
     matrix: List[Tuple[str, str, int, int, int, int]] = []
     for wl in workloads:
-        for scheme in schemes:
-            for cgb in cache_gb:
-                for t in threads:
+        for cgb in cache_gb:
+            for t in threads:
+                for scheme in schemes:
                     for sb in shard_bits_list:
                         for r in range(1, args.repeats + 1):
                             matrix.append(
@@ -1301,6 +1339,16 @@ def main() -> int:
             shared_loaded_workloads.add(wl)
         if row["exit_code"] != "0":
             print(f"[WARN] non-zero exit: {row['log_file']}", file=sys.stderr)
+
+        if args.fstrim_per_cell:
+            cell = (wl, cache_bytes, t)
+            if idx >= len(matrix):
+                end_of_cell = True
+            else:
+                nw, _ns, nc, nt, _nsb, _nr = matrix[idx]
+                end_of_cell = (nw, nc, nt) != cell
+            if end_of_cell:
+                fstrim_mount(args.fstrim_path)
 
     csv_path = results_dir / "summary.csv"
     fieldnames = list(rows[0].keys()) if rows else []
