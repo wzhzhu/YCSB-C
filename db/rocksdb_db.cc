@@ -637,6 +637,21 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.data_ema_beta = ParseDouble(
         props, "rocksdb.multi_level_cache_data_ema_beta",
         alloc_opts.data_ema_beta);
+    // Usage-aware growth gate + dead-capacity reclaim: a level that has not
+    // filled the capacity it holds is not a recipient, and capacity a level
+    // persistently fails to fill is reclaimed as structural excess.
+    alloc_opts.usage_grow_headroom = ParseDouble(
+        props, "rocksdb.multi_level_cache_usage_grow_headroom",
+        alloc_opts.usage_grow_headroom);
+    alloc_opts.usage_reclaim_margin = ParseDouble(
+        props, "rocksdb.multi_level_cache_usage_reclaim_margin",
+        alloc_opts.usage_reclaim_margin);
+    alloc_opts.usage_reclaim_rounds = static_cast<uint64_t>(std::max(
+        0, ParseInt(props, "rocksdb.multi_level_cache_usage_reclaim_rounds",
+                    static_cast<int>(alloc_opts.usage_reclaim_rounds))));
+    alloc_opts.usage_bootstrap_bytes = static_cast<size_t>(ParseUint64(
+        props, "rocksdb.multi_level_cache_usage_bootstrap_bytes",
+        alloc_opts.usage_bootstrap_bytes));
     // Ghost (repeat-miss) marginal scoring for the incremental mode: replaces
     // the exponential-model score with a direct per-level measurement of
     // capacity-convertible miss traffic (repeat misses on recently-missed
@@ -889,19 +904,16 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
           data->assign(level_count, 1.0);
           alpha->assign(level_count, 1.0);
 
-          uint64_t total_observed_data = 0;
-          size_t observed_levels = 0;
-          for (size_t level = 0; level < level_count; ++level) {
-            if (stats.data_sizes[level] > 0) {
-              total_observed_data += stats.data_sizes[level];
-              ++observed_levels;
-            }
-          }
-          const double default_data =
-              observed_levels > 0
-                  ? static_cast<double>(total_observed_data) /
-                        static_cast<double>(observed_levels)
-                  : 1.0;
+          // Levels with no on-disk data report D = 0 (inactive). They used to
+          // be substituted with the mean of the observed levels' data sizes
+          // (a legacy convenience for the water-filling solver), which handed
+          // empty levels a ~26 GiB phantom footprint at the 100 GiB dataset:
+          // the allocator then granted them data-share floors (~14 MiB each
+          // on the three empty upper levels) and recipient eligibility, and
+          // the phantom mass diluted every real level's floor share. The
+          // solver treats D = 0 levels as non-fundable, and the incremental
+          // allocator's floors/upper-bounds/score paths all key off D > 0,
+          // so zero is the semantically correct encoding for "no data".
 
           // Per-level distinct foreground blocks this window from the per-level
           // HLL. Consumed by the reuse-lambda path below (lambda_i = max(eps,
@@ -1012,9 +1024,7 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
             const uint64_t alpha_delta_hits =
                 alpha_exclude_compaction ? delta_fg_hits : delta_hits;
             const double raw_level_data_instant =
-                stats.data_sizes[level] > 0
-                    ? static_cast<double>(stats.data_sizes[level])
-                    : default_data;
+                static_cast<double>(stats.data_sizes[level]);
             auto& raw_history = raw_data_history[level];
             raw_history.push_back({now_us, raw_level_data_instant});
             while (raw_history.size() >= 2 &&
