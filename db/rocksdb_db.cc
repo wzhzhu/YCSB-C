@@ -512,6 +512,22 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
   options.max_open_files = ParseInt(props, "rocksdb.max_open_files", -1);
   options.target_file_size_base = static_cast<uint64_t>(
       ParseUint64(props, "rocksdb.target_file_size_base", 64ULL << 20));
+  // Write-stall trigger overrides, for the no-stall ablation: measured on
+  // wlA the back-pressure runs ~entirely through the pending-compaction-
+  // bytes slowdown, so disabling these (set triggers huge / limits to 0 =
+  // unlimited) isolates how much of a cache scheme's write-side advantage
+  // flows through explicit stalls vs. plain I/O contention. Values <0 (for
+  // triggers) or absent keep RocksDB defaults. NOTE: must be applied AFTER
+  // OptimizeLevelStyleCompaction(), which overwrites them.
+  const int l0_slowdown_override =
+      ParseInt(props, "rocksdb.level0_slowdown_writes_trigger", -999);
+  const int l0_stop_override =
+      ParseInt(props, "rocksdb.level0_stop_writes_trigger", -999);
+  constexpr uint64_t kPendingLimitUnset = std::numeric_limits<uint64_t>::max();
+  const uint64_t soft_pending_override = ParseUint64(
+      props, "rocksdb.soft_pending_compaction_bytes_limit", kPendingLimitUnset);
+  const uint64_t hard_pending_override = ParseUint64(
+      props, "rocksdb.hard_pending_compaction_bytes_limit", kPendingLimitUnset);
   options.compression = ParseCompressionType(
       props.GetProperty("rocksdb.compression", "none"));
   options.use_direct_reads = ParseBool(props, "rocksdb.use_direct_reads", false);
@@ -525,6 +541,18 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
 
   if (ParseBool(props, "rocksdb.optimize_level_style_compaction", true)) {
     options.OptimizeLevelStyleCompaction();
+  }
+  if (l0_slowdown_override != -999) {
+    options.level0_slowdown_writes_trigger = l0_slowdown_override;
+  }
+  if (l0_stop_override != -999) {
+    options.level0_stop_writes_trigger = l0_stop_override;
+  }
+  if (soft_pending_override != kPendingLimitUnset) {
+    options.soft_pending_compaction_bytes_limit = soft_pending_override;
+  }
+  if (hard_pending_override != kPendingLimitUnset) {
+    options.hard_pending_compaction_bytes_limit = hard_pending_override;
   }
   if (ParseBool(props, "rocksdb.increase_parallelism", true)) {
     const int parallelism = std::max(
@@ -1314,6 +1342,73 @@ RocksdbDB::~RocksdbDB() {
     std::cerr << "rocksdb\tstall_micros\t"
               << statistics_->getTickerCount(rocksdb::STALL_MICROS)
               << std::endl;
+
+    // Stall-cause breakdown. stall_micros only accounts EXPLICIT write
+    // delays/stops, which measured ~1us/write of the observed 52us/write
+    // p50 gap between schemes on wlA -- the bulk of the write-side
+    // difference flows through unaccounted channels (delayed-write rate
+    // limiting shifting the whole latency distribution, and group-commit
+    // queueing behind compaction bursts). The io_stalls.* counters from
+    // cfstats split stall EVENTS by trigger (L0 file count, pending
+    // compaction bytes, memtable count; *_slowdown vs *_stop), which
+    // identifies WHICH back-pressure mechanism a cache scheme relieves.
+    {
+      // kCFWriteStallStats / kDBWriteStallStats: per-(cause, condition)
+      // event counts, e.g. l0-file-count-limit delays/stops,
+      // pending-compaction-bytes delays/stops, memtable-limit stalls.
+      std::map<std::string, std::string> ws;
+      if (db_->GetMapProperty(rocksdb::DB::Properties::kCFWriteStallStats,
+                              &ws)) {
+        for (const auto& kv : ws) {
+          std::cerr << "rocksdb\tstallcf_" << kv.first << "\t" << kv.second
+                    << std::endl;
+        }
+      }
+      ws.clear();
+      if (db_->GetMapProperty(rocksdb::DB::Properties::kDBWriteStallStats,
+                              &ws)) {
+        for (const auto& kv : ws) {
+          std::cerr << "rocksdb\tstalldb_" << kv.first << "\t" << kv.second
+                    << std::endl;
+        }
+      }
+      // Delayed-write rate limiter state at run end (bytes/s the write
+      // controller currently allows; 0 or absent means no active delay).
+      uint64_t adwr = 0;
+      if (db_->GetIntProperty("rocksdb.actual-delayed-write-rate", &adwr)) {
+        std::cerr << "rocksdb\tactual_delayed_write_rate\t" << adwr
+                  << std::endl;
+      }
+      // Per-stall-event duration distribution (WRITE_STALL histogram):
+      // count tells how OFTEN back-pressure engaged, mean how hard.
+      rocksdb::HistogramData hs;
+      statistics_->histogramData(rocksdb::WRITE_STALL, &hs);
+      std::cerr << "rocksdb\twrite_stall_hist_count\t"
+                << static_cast<uint64_t>(hs.count) << std::endl;
+      std::cerr << "rocksdb\twrite_stall_hist_mean_us\t" << hs.average
+                << std::endl;
+      std::cerr << "rocksdb\twrite_stall_hist_p99_us\t" << hs.percentile99
+                << std::endl;
+      // Compaction volume: total bytes read/written by compaction during
+      // the transaction phase. Faster/cheaper compaction is the upstream
+      // of every stall channel, so schemes are compared on equal terms.
+      std::cerr << "rocksdb\tcompact_read_bytes\t"
+                << statistics_->getTickerCount(rocksdb::COMPACT_READ_BYTES)
+                << std::endl;
+      std::cerr << "rocksdb\tcompact_write_bytes\t"
+                << statistics_->getTickerCount(rocksdb::COMPACT_WRITE_BYTES)
+                << std::endl;
+      // WAL sync/write volume for the group-commit channel.
+      std::cerr << "rocksdb\twrite_with_wal\t"
+                << statistics_->getTickerCount(rocksdb::WRITE_WITH_WAL)
+                << std::endl;
+      rocksdb::HistogramData hw;
+      statistics_->histogramData(rocksdb::COMPACTION_TIME, &hw);
+      std::cerr << "rocksdb\tcompaction_time_count\t"
+                << static_cast<uint64_t>(hw.count) << std::endl;
+      std::cerr << "rocksdb\tcompaction_time_mean_us\t" << hw.average
+                << std::endl;
+    }
 
     // Per-operation latency percentiles (microseconds) from RocksDB's own
     // DB_GET / DB_WRITE histograms. These are recorded at the default stats
