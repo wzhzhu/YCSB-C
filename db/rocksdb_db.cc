@@ -1352,24 +1352,38 @@ RocksdbDB::~RocksdbDB() {
     // cfstats split stall EVENTS by trigger (L0 file count, pending
     // compaction bytes, memtable count; *_slowdown vs *_stop), which
     // identifies WHICH back-pressure mechanism a cache scheme relieves.
-    {
+    // db_ can be null here if DB::Open failed (constructor resets it and
+    // returns early while statistics_ stays set); the map-property reads
+    // below must not dereference it.
+    if (db_ != nullptr) {
       // kCFWriteStallStats / kDBWriteStallStats: per-(cause, condition)
       // event counts, e.g. l0-file-count-limit delays/stops,
       // pending-compaction-bytes delays/stops, memtable-limit stalls.
+      // Key names arrive hyphenated (e.g. pending-compaction-bytes-delays);
+      // normalize to underscores so the matrix runner's metric regex
+      // ([a-zA-Z0-9_]+) picks them up instead of silently skipping them.
+      const auto sanitize = [](std::string name) {
+        for (char& c : name) {
+          if (!std::isalnum(static_cast<unsigned char>(c))) {
+            c = '_';
+          }
+        }
+        return name;
+      };
       std::map<std::string, std::string> ws;
       if (db_->GetMapProperty(rocksdb::DB::Properties::kCFWriteStallStats,
                               &ws)) {
         for (const auto& kv : ws) {
-          std::cerr << "rocksdb\tstallcf_" << kv.first << "\t" << kv.second
-                    << std::endl;
+          std::cerr << "rocksdb\tstallcf_" << sanitize(kv.first) << "\t"
+                    << kv.second << std::endl;
         }
       }
       ws.clear();
       if (db_->GetMapProperty(rocksdb::DB::Properties::kDBWriteStallStats,
                               &ws)) {
         for (const auto& kv : ws) {
-          std::cerr << "rocksdb\tstalldb_" << kv.first << "\t" << kv.second
-                    << std::endl;
+          std::cerr << "rocksdb\tstalldb_" << sanitize(kv.first) << "\t"
+                    << kv.second << std::endl;
         }
       }
       // Delayed-write rate limiter state at run end (bytes/s the write
