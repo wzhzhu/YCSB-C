@@ -715,6 +715,15 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.ghost_dist_decompress_max = ParseDouble(
         props, "rocksdb.multi_level_cache_ghost_dist_decompress_max",
         alloc_opts.ghost_dist_decompress_max);
+    // Realization credit cap: a full level's capture score is capped at
+    // frac * measured hit density, discounting promises that compaction
+    // churn never lets pay out.
+    alloc_opts.score_credit_frac =
+        ParseDouble(props, "rocksdb.multi_level_cache_score_credit_frac",
+                    alloc_opts.score_credit_frac);
+    alloc_opts.score_credit_min_cap_bytes = static_cast<size_t>(std::max(
+        0, ParseInt(props, "rocksdb.multi_level_cache_score_credit_min_cap_bytes",
+                    static_cast<int>(alloc_opts.score_credit_min_cap_bytes))));
     if (alloc_opts.use_ghost_marginal && multi_level_cache_ != nullptr) {
       const uint32_t ghost_slots_log2 = static_cast<uint32_t>(std::max(
           0, ParseInt(props, "rocksdb.multi_level_cache_ghost_slots_log2",
