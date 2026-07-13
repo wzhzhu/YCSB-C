@@ -666,6 +666,22 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.ghost_dist_block_bytes = static_cast<size_t>(std::max(
         1, ParseInt(props, "rocksdb.multi_level_cache_ghost_dist_block_bytes",
                     static_cast<int>(alloc_opts.ghost_dist_block_bytes))));
+    // In-flight duplicate-miss filter: histogram buckets at or below this
+    // distance are discarded for levels holding real capacity (see
+    // ghost_inflight_dist_bytes / ghost_inflight_min_cap_bytes).
+    alloc_opts.ghost_inflight_dist_bytes = static_cast<size_t>(std::max(
+        0,
+        ParseInt(props, "rocksdb.multi_level_cache_ghost_inflight_dist_bytes",
+                 static_cast<int>(alloc_opts.ghost_inflight_dist_bytes))));
+    alloc_opts.ghost_inflight_min_cap_bytes = static_cast<size_t>(std::max(
+        0, ParseInt(props,
+                    "rocksdb.multi_level_cache_ghost_inflight_min_cap_bytes",
+                    static_cast<int>(alloc_opts.ghost_inflight_min_cap_bytes))));
+    // Donor retention cost: full-level donors are ranked and gated by the
+    // measured per-byte hit density of their resident bytes.
+    alloc_opts.donor_retention_frac = ParseDouble(
+        props, "rocksdb.multi_level_cache_donor_retention_frac",
+        alloc_opts.donor_retention_frac);
     if (alloc_opts.use_ghost_marginal && multi_level_cache_ != nullptr) {
       const uint32_t ghost_slots_log2 = static_cast<uint32_t>(std::max(
           0, ParseInt(props, "rocksdb.multi_level_cache_ghost_slots_log2",
