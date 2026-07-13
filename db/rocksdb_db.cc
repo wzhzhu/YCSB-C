@@ -682,6 +682,11 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.donor_retention_frac = ParseDouble(
         props, "rocksdb.multi_level_cache_donor_retention_frac",
         alloc_opts.donor_retention_frac);
+    // Reuse-distance decompression: corrects the (1-h) understatement of
+    // measured distances that inflates high-hit levels' capture scores.
+    alloc_opts.ghost_dist_decompress_max = ParseDouble(
+        props, "rocksdb.multi_level_cache_ghost_dist_decompress_max",
+        alloc_opts.ghost_dist_decompress_max);
     if (alloc_opts.use_ghost_marginal && multi_level_cache_ != nullptr) {
       const uint32_t ghost_slots_log2 = static_cast<uint32_t>(std::max(
           0, ParseInt(props, "rocksdb.multi_level_cache_ghost_slots_log2",
