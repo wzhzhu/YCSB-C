@@ -724,6 +724,11 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.score_credit_min_cap_bytes = static_cast<size_t>(std::max(
         0, ParseInt(props, "rocksdb.multi_level_cache_score_credit_min_cap_bytes",
                     static_cast<int>(alloc_opts.score_credit_min_cap_bytes))));
+    // Density floor: symmetric half of the credit band; compensates the
+    // ghost's churn blindness (repeats whose key dies unregistered).
+    alloc_opts.score_credit_floor_frac = ParseDouble(
+        props, "rocksdb.multi_level_cache_score_credit_floor_frac",
+        alloc_opts.score_credit_floor_frac);
     if (alloc_opts.use_ghost_marginal && multi_level_cache_ != nullptr) {
       const uint32_t ghost_slots_log2 = static_cast<uint32_t>(std::max(
           0, ParseInt(props, "rocksdb.multi_level_cache_ghost_slots_log2",
