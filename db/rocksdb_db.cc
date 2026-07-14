@@ -572,6 +572,27 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
   table_options.pin_l0_filter_and_index_blocks_in_cache = ParseBool(
       props, "rocksdb.pin_l0_filter_and_index_blocks_in_cache", false);
   table_options.block_size = ParseUint64(props, "rocksdb.block_size", 4096);
+  // Flush prepopulate (cache-for-compaction, supply side): blocks written by
+  // memtable flush are inserted into the block cache immediately, so the
+  // L0->L1 compaction that consumes them shortly after finds them resident
+  // instead of re-reading them from the device. Only pays off when the cache
+  // can actually HOLD flushed blocks until the merge (MLC funds L0 via the
+  // stall-weighted compaction-value term); on a shared cache it evicts
+  // foreground-hot blocks for one-shot flush output, so default off.
+  if (ParseBool(props, "rocksdb.prepopulate_block_cache_flush_only", false)) {
+    table_options.prepopulate_block_cache =
+        rocksdb::BlockBasedTableOptions::PrepopulateBlockCache::kFlushOnly;
+  }
+  // Stronger variant: also insert COMPACTION outputs (at BOTTOM priority).
+  // Base-level compaction outputs are both (a) the next merge's inputs and
+  // (b) freshly rewritten versions of zipfian-hot ranges the foreground is
+  // about to re-read; flush-only warming cannot serve either. Takes
+  // precedence over the flush_only flag when both are set.
+  if (ParseBool(props, "rocksdb.prepopulate_block_cache_flush_and_compaction",
+                false)) {
+    table_options.prepopulate_block_cache = rocksdb::BlockBasedTableOptions::
+        PrepopulateBlockCache::kFlushAndCompaction;
+  }
 
   const int bloom_bits = ParseInt(props, "rocksdb.bloom_bits_per_key", 0);
   if (bloom_bits > 0) {
@@ -729,6 +750,14 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.score_credit_floor_frac = ParseDouble(
         props, "rocksdb.multi_level_cache_score_credit_floor_frac",
         alloc_opts.score_credit_floor_frac);
+    // Compaction-value term (cache-for-compaction): stall-weighted per-byte
+    // compaction miss density added to level scores. See comp_value_weight.
+    alloc_opts.comp_value_weight =
+        ParseDouble(props, "rocksdb.multi_level_cache_comp_value_weight",
+                    alloc_opts.comp_value_weight);
+    alloc_opts.stall_weight_ref =
+        ParseDouble(props, "rocksdb.multi_level_cache_stall_weight_ref",
+                    alloc_opts.stall_weight_ref);
     if (alloc_opts.use_ghost_marginal && multi_level_cache_ != nullptr) {
       const uint32_t ghost_slots_log2 = static_cast<uint32_t>(std::max(
           0, ParseInt(props, "rocksdb.multi_level_cache_ghost_slots_log2",
@@ -889,7 +918,8 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
 
     multi_level_allocator_ = std::make_unique<rocksdb::MultiLevelCacheAllocator>(
         multi_level_cache_,
-        [cache = multi_level_cache_, db = db_.get(), alpha_floor, alpha_max,
+        [cache = multi_level_cache_, db = db_.get(), stats = statistics_.get(),
+         alpha_floor, alpha_max,
          use_effective_data_size, track_working_set,
          use_reuse_lambda, alpha_window_rounds, data_window_rounds,
          data_window_us, use_constant_one_alpha, ill_conditioning_guard_enabled,
@@ -905,7 +935,8 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
          raw_data_history =
              std::vector<std::deque<std::pair<uint64_t, double>>>{}](
             std::vector<double>* lambda, std::vector<double>* data,
-            std::vector<double>* alpha, uint64_t* l0_file_count) mutable {
+            std::vector<double>* alpha, uint64_t* l0_file_count,
+            uint64_t* stall_micros) mutable {
           if (cache == nullptr || lambda == nullptr || data == nullptr ||
               alpha == nullptr) {
             return false;
@@ -919,6 +950,16 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
               db->GetIntProperty("rocksdb.num-files-at-level0", &v);
             }
             *l0_file_count = v;
+          }
+          // Cumulative write-stall micros: the allocator differentiates this
+          // into the stall-intensity weight for the compaction-value term
+          // (converting compaction reads only buys throughput when the
+          // workload is stall-bound). Cheap relaxed ticker read.
+          if (stall_micros != nullptr) {
+            *stall_micros =
+                stats != nullptr
+                    ? stats->getTickerCount(rocksdb::STALL_MICROS)
+                    : 0;
           }
           const auto stats = cache->GetLevelMetricsSnapshot();
           const size_t level_count = stats.lookups.size();
