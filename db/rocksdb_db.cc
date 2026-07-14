@@ -758,6 +758,27 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.stall_weight_ref =
         ParseDouble(props, "rocksdb.multi_level_cache_stall_weight_ref",
                     alloc_opts.stall_weight_ref);
+    // Stall-adaptive lazy mode: when unstalled and converged, downsample
+    // ghost recording and stretch full allocation rounds. Recovers most of
+    // MLC's fixed overhead at low concurrency; exits on any back-pressure.
+    alloc_opts.lazy_mode_enabled =
+        ParseBool(props, "rocksdb.multi_level_cache_lazy_mode",
+                  alloc_opts.lazy_mode_enabled);
+    alloc_opts.lazy_stall_intensity_max = ParseDouble(
+        props, "rocksdb.multi_level_cache_lazy_stall_intensity_max",
+        alloc_opts.lazy_stall_intensity_max);
+    alloc_opts.lazy_after_stable_rounds = static_cast<uint64_t>(std::max(
+        1, ParseInt(props, "rocksdb.multi_level_cache_lazy_after_stable_rounds",
+                    static_cast<int>(alloc_opts.lazy_after_stable_rounds))));
+    alloc_opts.lazy_drift_tolerance_ratio = ParseDouble(
+        props, "rocksdb.multi_level_cache_lazy_drift_tolerance_ratio",
+        alloc_opts.lazy_drift_tolerance_ratio);
+    alloc_opts.lazy_ghost_sample_shift = static_cast<uint32_t>(std::max(
+        0, ParseInt(props, "rocksdb.multi_level_cache_lazy_ghost_sample_shift",
+                    static_cast<int>(alloc_opts.lazy_ghost_sample_shift))));
+    alloc_opts.lazy_round_multiplier = static_cast<uint32_t>(std::max(
+        1, ParseInt(props, "rocksdb.multi_level_cache_lazy_round_multiplier",
+                    static_cast<int>(alloc_opts.lazy_round_multiplier))));
     if (alloc_opts.use_ghost_marginal && multi_level_cache_ != nullptr) {
       const uint32_t ghost_slots_log2 = static_cast<uint32_t>(std::max(
           0, ParseInt(props, "rocksdb.multi_level_cache_ghost_slots_log2",
