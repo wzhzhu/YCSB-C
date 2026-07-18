@@ -628,14 +628,32 @@ def parse_args() -> argparse.Namespace:
         "internal state uniform across compared schemes within a cell.",
     )
     p.add_argument(
+        "--fstrim-per-run",
+        action="store_true",
+        help="Run fstrim on --fstrim-path after EVERY run. Stronger than "
+        "--fstrim-per-cell: within a cell the schemes run back-to-back, so "
+        "the later scheme otherwise starts on a drive dirtied by the "
+        "earlier one's writes (a systematic bias against whichever scheme "
+        "is listed last).",
+    )
+    p.add_argument(
+        "--fstrim-settle-sec",
+        type=int,
+        default=0,
+        help="Idle seconds after each fstrim, giving the SSD firmware time "
+        "to actually garbage-collect the trimmed blocks (fstrim only "
+        "notifies; GC is asynchronous).",
+    )
+    p.add_argument(
         "--fstrim-path",
         default="/mnt/rocksdb_nvme",
-        help="Mount point to trim when --fstrim-per-cell is set.",
+        help="Mount point to trim when --fstrim-per-cell/--fstrim-per-run "
+        "is set.",
     )
     return p.parse_args()
 
 
-def fstrim_mount(mount_path: str) -> None:
+def fstrim_mount(mount_path: str, settle_sec: int = 0) -> None:
     """Best-effort TRIM after a matrix cell; failures are logged, not fatal."""
     try:
         proc = subprocess.run(
@@ -659,6 +677,10 @@ def fstrim_mount(mount_path: str) -> None:
             )
     except OSError as exc:
         print(f"[WARN] fstrim {mount_path} failed: {exc}", file=sys.stderr)
+        return
+    if settle_sec > 0:
+        print(f"[INFO] fstrim settle {settle_sec}s", flush=True)
+        time.sleep(settle_sec)
 
 
 def load_spec(path: pathlib.Path) -> Dict[str, str]:
@@ -1340,7 +1362,9 @@ def main() -> int:
         if row["exit_code"] != "0":
             print(f"[WARN] non-zero exit: {row['log_file']}", file=sys.stderr)
 
-        if args.fstrim_per_cell:
+        if args.fstrim_per_run:
+            fstrim_mount(args.fstrim_path, args.fstrim_settle_sec)
+        elif args.fstrim_per_cell:
             cell = (wl, cache_bytes, t)
             if idx >= len(matrix):
                 end_of_cell = True
@@ -1348,7 +1372,7 @@ def main() -> int:
                 nw, _ns, nc, nt, _nsb, _nr = matrix[idx]
                 end_of_cell = (nw, nc, nt) != cell
             if end_of_cell:
-                fstrim_mount(args.fstrim_path)
+                fstrim_mount(args.fstrim_path, args.fstrim_settle_sec)
 
     csv_path = results_dir / "summary.csv"
     fieldnames = list(rows[0].keys()) if rows else []
