@@ -542,6 +542,17 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
   if (ParseBool(props, "rocksdb.optimize_level_style_compaction", true)) {
     options.OptimizeLevelStyleCompaction();
   }
+  // Disable age-based compaction. RocksDB's default ttl (30 days, leveled)
+  // silently rewrites every SST older than the threshold into the bottom
+  // level at DB open: a golden snapshot filled on day 0 produces multi-level
+  // clones until day 30 and single-level (pure L6) clones after, flattening
+  // the LSM mid-benchmark and making results depend on the calendar date of
+  // the run (bit the 0718 matrix: wlC/D/E ran on TTL-compacted L6-only
+  // clones, wlD fg hit dropped 6pt for every scheme). Benchmarks want the
+  // LSM shape determined by data and compaction logic alone.
+  options.ttl = ParseUint64(props, "rocksdb.ttl_seconds", 0);
+  options.periodic_compaction_seconds =
+      ParseUint64(props, "rocksdb.periodic_compaction_seconds", 0);
   if (l0_slowdown_override != -999) {
     options.level0_slowdown_writes_trigger = l0_slowdown_override;
   }
