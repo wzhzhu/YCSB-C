@@ -158,8 +158,21 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
     std::shared_ptr<rocksdb::MultiLevelCache>* out_multi_level_cache) {
   const std::string cache_type =
       props.GetProperty(kRocksdbCacheTypeKey, "lru_cache");
-  const int num_levels =
+  const int lsm_levels =
       std::max(1, ParseInt(props, "rocksdb.num_levels", 7));
+  // Merge the deepest N LSM levels into one sub-cache slot (1 = no merge).
+  // E.g. 2 folds L5+L6 into a single bottom slot: with 7 LSM levels the MLC
+  // gets 6 sub-caches and any block tagged L5/L6 routes to slot 5. Motivation
+  // (wlB): the L5-vs-L6 split is the allocation decision most degraded by
+  // compaction churn (ghost fingerprints die when blocks are rewritten), and
+  // each extra sub-cache adds partition overhead; the bottom two levels have
+  // similar coldness, so let one HCC share that capacity by global heat.
+  const int merge_bottom_levels = std::min(
+      lsm_levels,
+      std::max(1, ParseInt(props,
+                           "rocksdb.multi_level_cache_merge_bottom_levels",
+                           1)));
+  const int num_levels = lsm_levels - (merge_bottom_levels - 1);
   const bool force_l0 = ParseBool(
       props, "rocksdb.multi_level_cache_force_route_all_to_l0", false);
   const int cache_numshardbits = ParseInt(props, "rocksdb.cache_numshardbits", -1);
@@ -173,11 +186,15 @@ std::shared_ptr<rocksdb::Cache> CreateMultiLevelCache(
       static_cast<uint32_t>(ParseUint64(props, "rocksdb.cache_hash_seed", 0));
 
   // Common MLC runtime settings applied to every constructed variant.
-  auto apply_mlc_common = [&props](rocksdb::MultiLevelCache& cache) {
+  auto apply_mlc_common = [&props, merge_bottom_levels,
+                           num_levels](rocksdb::MultiLevelCache& cache) {
     cache.SetSharedPoolRatio(
         ParseDouble(props, "rocksdb.multi_level_cache_shared_pool_ratio", 0.0));
     cache.SetInsertBypassCapacity(static_cast<size_t>(ParseUint64(
         props, "rocksdb.multi_level_cache_insert_bypass_capacity_bytes", 0)));
+    if (merge_bottom_levels > 1) {
+      cache.SetRouteLevelClamp(static_cast<size_t>(num_levels) - 1);
+    }
   };
 
   if (cache_type == "lru_cache") {
@@ -797,6 +814,12 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
       multi_level_cache_->SetGhostTrackingEnabled(
           true, ghost_slots_log2,
           /*segmented=*/alloc_opts.use_ghost_capture_rate);
+      // Churn-immune ghost identity: fingerprint point-read misses by user
+      // key hash instead of block cache key hash, so repeat signals survive
+      // compaction rewrites (wlB direction-A ablation; see
+      // MultiLevelCache::SetGhostUserKeyFingerprint).
+      multi_level_cache_->SetGhostUserKeyFingerprint(ParseBool(
+          props, "rocksdb.multi_level_cache_ghost_user_key_fp", false));
     }
     // Per-byte normalization of the ghost score (score = ghost_hits / D_i):
     // restores the capacity-price-per-hit ordering the raw count lacks.
