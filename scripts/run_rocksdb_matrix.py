@@ -7,10 +7,11 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 WORKLOAD_SPECS = {
@@ -650,6 +651,30 @@ def parse_args() -> argparse.Namespace:
         help="Mount point to trim when --fstrim-per-cell/--fstrim-per-run "
         "is set.",
     )
+    p.add_argument(
+        "--fstrim-idle-util",
+        type=float,
+        default=0.0,
+        help="If >0, after each fstrim poll /proc/diskstats and wait until the "
+        "backing device's %%util (over a 1s window) drops below this value "
+        "before the next run (a deterministic replacement for guessing "
+        "--fstrim-settle-sec: fstrim only notifies the SSD, GC is async). "
+        "E.g. 5.0.",
+    )
+    p.add_argument(
+        "--fstrim-idle-max-sec",
+        type=int,
+        default=120,
+        help="Cap on the --fstrim-idle-util poll; proceed anyway after this "
+        "many seconds even if the drive has not gone idle.",
+    )
+    p.add_argument(
+        "--no-stray-guard",
+        action="store_true",
+        help="Disable the pre-run stray-ycsbc kill guard (on by default). The "
+        "guard SIGKILLs any leftover ycsbc from an abnormally terminated "
+        "prior run so it cannot steal cores and confound the next run.",
+    )
     return p.parse_args()
 
 
@@ -681,6 +706,135 @@ def fstrim_mount(mount_path: str, settle_sec: int = 0) -> None:
     if settle_sec > 0:
         print(f"[INFO] fstrim settle {settle_sec}s", flush=True)
         time.sleep(settle_sec)
+
+
+def kill_stray_ycsbc(ycsb_root: pathlib.Path) -> None:
+    """SIGKILL any lingering ycsbc process before a run.
+
+    A previous run whose ycsbc was terminated abnormally (e.g. a profiling
+    session killed with pkill/setsid, or an interrupted matrix) can leave a
+    process still burning all cores. The next run then shares the machine with
+    it, inflating latency and (at high thread counts) triggering scheduler /
+    futex contention that looks like a throughput collapse but is really cross-
+    run interference. Guarantee a clean core budget before every run.
+    """
+    ycsbc_bin = str(ycsb_root / "ycsbc")
+    try:
+        found = subprocess.run(
+            ["pgrep", "-f", ycsbc_bin],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return
+    pids = [p for p in (found.stdout or "").split() if p.isdigit()]
+    # Never target our own process tree (pgrep -f can match this script's
+    # command line if it happens to contain the path); ycsbc pids are the
+    # binary itself, so filtering by our pid/ppid is enough.
+    mine = {str(os.getpid()), str(os.getppid())}
+    pids = [p for p in pids if p not in mine]
+    if not pids:
+        return
+    print(
+        f"[WARN] {len(pids)} stray ycsbc process(es) found before run "
+        f"({','.join(pids)}); killing to protect the core budget",
+        file=sys.stderr,
+        flush=True,
+    )
+    for p in pids:
+        try:
+            os.kill(int(p), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+    time.sleep(2)
+
+
+def _device_for_path(path: str) -> Optional[str]:
+    """Return the /proc/diskstats device name (e.g. 'dm-1', 'nvme0n1') backing
+    a mount path. Resolves LVM/device-mapper symlinks to their real dm-N node
+    (that is the name that appears in diskstats), so no iostat/sysstat is
+    needed."""
+    try:
+        src = subprocess.run(
+            ["findmnt", "-no", "SOURCE", "--target", path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    dev = (src.stdout or "").strip()
+    if not dev.startswith("/dev/"):
+        return None
+    # Resolve symlinks (/dev/mapper/xxx -> ../dm-1) to the real node name.
+    real = os.path.realpath(dev)
+    return os.path.basename(real)
+
+
+def _disk_io_ticks_ms(dev: str) -> Optional[int]:
+    """io_ticks (ms spent doing I/O) for `dev` from /proc/diskstats, or None."""
+    try:
+        with open("/proc/diskstats", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                # major minor name [11 stat fields]; field index 12 is
+                # "ms doing I/Os" (io_ticks), the basis for %util.
+                if len(parts) >= 13 and parts[2] == dev:
+                    return int(parts[12])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def wait_for_disk_idle(
+    path: str, util_threshold: float, max_wait_sec: int
+) -> None:
+    """Poll /proc/diskstats until the device backing `path` is below
+    util_threshold percent busy over a 1s window.
+
+    fstrim only NOTIFIES the SSD of freed blocks; the actual erase/GC is
+    asynchronous, so a run started immediately after a large trim can begin on
+    a drive still busy garbage-collecting -- a systematic latency confound.
+    Rather than guess a fixed settle duration, measure utilization directly
+    (delta io_ticks / delta wall time) and proceed once the drive has actually
+    gone idle (or the cap is hit). Best-effort: any failure just returns.
+    """
+    if util_threshold <= 0:
+        return
+    dev = _device_for_path(path)
+    if dev is None or _disk_io_ticks_ms(dev) is None:
+        print(
+            f"[WARN] could not read /proc/diskstats for {path} "
+            f"(dev={dev}); skipping disk-idle poll",
+            file=sys.stderr,
+        )
+        return
+    deadline = time.time() + max_wait_sec
+    interval = 1.0
+    while time.time() < deadline:
+        t0 = time.time()
+        ticks0 = _disk_io_ticks_ms(dev)
+        time.sleep(interval)
+        ticks1 = _disk_io_ticks_ms(dev)
+        if ticks0 is None or ticks1 is None:
+            return
+        wall_ms = (time.time() - t0) * 1000.0
+        util = 100.0 * (ticks1 - ticks0) / wall_ms if wall_ms > 0 else 0.0
+        if util < util_threshold:
+            print(
+                f"[INFO] disk {dev} idle (%util={util:.1f} < {util_threshold})",
+                flush=True,
+            )
+            return
+        print(
+            f"[INFO] disk {dev} busy (%util={util:.1f}); waiting for GC",
+            flush=True,
+        )
+    print(
+        f"[WARN] disk {dev} still busy after {max_wait_sec}s cap; proceeding",
+        file=sys.stderr,
+    )
 
 
 def load_spec(path: pathlib.Path) -> Dict[str, str]:
@@ -1336,6 +1490,9 @@ def main() -> int:
             clean_db_before_run = True
             cleanup_after_run = True
 
+        if not args.no_stray_guard:
+            kill_stray_ycsbc(ycsb_root)
+
         row = run_once(
             ycsb_root,
             results_dir,
@@ -1362,8 +1519,10 @@ def main() -> int:
         if row["exit_code"] != "0":
             print(f"[WARN] non-zero exit: {row['log_file']}", file=sys.stderr)
 
+        did_fstrim = False
         if args.fstrim_per_run:
             fstrim_mount(args.fstrim_path, args.fstrim_settle_sec)
+            did_fstrim = True
         elif args.fstrim_per_cell:
             cell = (wl, cache_bytes, t)
             if idx >= len(matrix):
@@ -1373,6 +1532,11 @@ def main() -> int:
                 end_of_cell = (nw, nc, nt) != cell
             if end_of_cell:
                 fstrim_mount(args.fstrim_path, args.fstrim_settle_sec)
+                did_fstrim = True
+        if did_fstrim and args.fstrim_idle_util > 0:
+            wait_for_disk_idle(
+                args.fstrim_path, args.fstrim_idle_util, args.fstrim_idle_max_sec
+            )
 
     csv_path = results_dir / "summary.csv"
     fieldnames = list(rows[0].keys()) if rows else []
