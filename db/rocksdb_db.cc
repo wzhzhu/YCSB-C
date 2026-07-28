@@ -807,6 +807,13 @@ RocksdbDB::RocksdbDB(const utils::Properties& props) {
     alloc_opts.lazy_round_multiplier = static_cast<uint32_t>(std::max(
         1, ParseInt(props, "rocksdb.multi_level_cache_lazy_round_multiplier",
                     static_cast<int>(alloc_opts.lazy_round_multiplier))));
+    // Physical-apply convergence gate: skip flushing capacity to the sub-caches
+    // (and its all-shard lock/purge) while the model is drift-stationary, so a
+    // converged equilibrium stops avalanching futex contention at high thread
+    // counts. 0 disables (apply every round).
+    alloc_opts.apply_convergence_drift_ratio = ParseDouble(
+        props, "rocksdb.multi_level_cache_apply_convergence_drift_ratio",
+        alloc_opts.apply_convergence_drift_ratio);
     if (alloc_opts.use_ghost_marginal && multi_level_cache_ != nullptr) {
       const uint32_t ghost_slots_log2 = static_cast<uint32_t>(std::max(
           0, ParseInt(props, "rocksdb.multi_level_cache_ghost_slots_log2",
