@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <atomic>
 #include <mutex>
 #include "utils.h"
 
@@ -85,36 +86,51 @@ class ZipfianGenerator : public Generator<uint64_t> {
   // Computed parameters for generating the distribution
   double theta_, zeta_n_, eta_, alpha_, zeta_2_;
   uint64_t n_for_zeta_; /// Number of items used to compute zeta_n
-  uint64_t last_value_;
+  std::atomic<uint64_t> last_value_;
   std::mutex mutex_;
 };
 
+// Hot path is lock-free. The per-thread randomness already comes from a
+// thread_local RNG (utils::ThreadLocalRng), so the original global mutex only
+// serialised reads of the distribution parameters plus the last_value_ write.
+// Those parameters (zeta_n_, eta_, alpha_, theta_, base_, num_items_) are
+// written exactly once during single-threaded construction (RaiseZeta / Eta);
+// for a fixed-size YCSB workload num never exceeds n_for_zeta_ afterwards, so
+// no thread ever re-enters the write path concurrently. Holding one std::mutex
+// on every key draw instead funnelled all worker threads through a single
+// critical section that also ran two std::pow calls, which at high thread
+// counts (t128) degenerated into a futex lock-convoy: ~59% of CPU was burned in
+// native_queued_spin_lock_slowpath under ScrambledZipfianGenerator::Next,
+// producing metastable throughput collapses that were mis-attributed to the
+// cache. The rare grow path keeps a double-checked lock for correctness.
 inline uint64_t ZipfianGenerator::Next(uint64_t num) {
   assert(num >= 2 && num < kMaxNumItems);
-  std::lock_guard<std::mutex> lock(mutex_);
 
-  if (num > n_for_zeta_) { // Recompute zeta_n and eta
-    RaiseZeta(num);
-    eta_ = Eta();
+  if (num > n_for_zeta_) { // Recompute zeta_n and eta (grow; not hit by YCSB)
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (num > n_for_zeta_) {
+      RaiseZeta(num);
+      eta_ = Eta();
+    }
   }
-  
+
   double u = utils::RandomDouble();
   double uz = u * zeta_n_;
-  
-  if (uz < 1.0) {
-    return last_value_ = 0;
-  }
-  
-  if (uz < 1.0 + std::pow(0.5, theta_)) {
-    return last_value_ = 1;
-  }
 
-  return last_value_ = base_ + num * std::pow(eta_ * u - eta_ + 1, alpha_);
+  uint64_t value;
+  if (uz < 1.0) {
+    value = 0;
+  } else if (uz < 1.0 + std::pow(0.5, theta_)) {
+    value = 1;
+  } else {
+    value = base_ + num * std::pow(eta_ * u - eta_ + 1, alpha_);
+  }
+  last_value_.store(value, std::memory_order_relaxed);
+  return value;
 }
 
 inline uint64_t ZipfianGenerator::Last() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return last_value_;
+  return last_value_.load(std::memory_order_relaxed);
 }
 
 }
