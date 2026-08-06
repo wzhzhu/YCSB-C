@@ -550,6 +550,69 @@
     - **待办**：100GB 全量重跑（默认 schemes 已含 `all_levels`/`fixed_bottom`/`all_levels_sharded`）
       做正式对照 + 多种子定性,确认 auto-shard 推荐稳健。
 
+22. **【初步结论，2026-08-04】把元数据也放进 block cache（`cache_index_and_filter_blocks
+    =true`）无收益；且 MLC+wlB 下触发灾难性吞吐崩塌，暂不深究**
+    - **实验**：干净 harness（生成器去锁 genfix + 进程守卫 + 磁盘空闲轮询）下三臂配对——
+      off（不缓存元数据，主矩阵默认）/ on（缓存，默认优先级）/ hipri（缓存 +
+      `cache_index_and_filter_blocks_with_high_priority=true`）；负载 wlB（MLC 短板）+
+      wlC（只读对照），4/8GB × t64/t128 × {hcc, mlc_hcc_all_levels_sharded}，各 2 repeat。
+      结果目录：`results/rocksdb-matrix/meta-{off,on,on-hipri}-0804`。
+      **测量口径**：开 meta 后 `cache_fg_hit_ratio` 被 ~100% 命中的元数据抬高（冒烟 0.93），
+      不可跨臂比；用**吞吐**与 **`cache_data_hit_ratio`**（隔离数据块）判定。
+    - **结论 1：缓存元数据对所有方案都是净负收益。** 数据命中率一致下降 ~1.5–2.4pt
+      （元数据挤占数据块），吞吐 HCC/MLC 普遍 −3~9%（wlC 两方案同量级）。机理：小而热的
+      filter/index 块**本就常驻 OS page cache**、磁盘读≈0；再塞进 block cache 只白白挤掉
+      数据块、不省真实 I/O。high-priority 也救不回（HCC 经 CLOCK 初始 countdown 确实理会
+      优先级，见 clock_cache.cc `GetInitialCountdown`，但整体仍负，且倾向进一步压低数据
+      命中）。**与一.7/一.14/二点五"主矩阵元数据不进 block cache"的决策一致 → 维持
+      `cache_index_and_filter_blocks=false`。**
+    - **结论 2：MLC + wlB + meta-on = 灾难性崩塌（−70~90%），是一个真实但未深究的 MLC 缺陷。**
+      wlB MLC 吞吐 off→on：4G t64 674→87、4G t128 771→117、8G t64 733→131、8G t128 846→497
+      （hipri 类似，93/224/68/713，未修复）；**而 data_hit_ratio 几乎不变（0.325→0.324）**。
+      吞吐暴跌但命中率不变 = **串行化/争用崩塌**（与生成器锁护航、一.21 单实例 AutoHCC 争用
+      同族），非缓存失效。推测机理：开元数据缓存后每次读多查 filter+index 两块，**MLC 查询
+      路径调用量约 ×3**，在 wlB（本就压榨 allocator/ghost 记账）上把某热路径
+      （FindHandleOwner / ghost 记账 / 分配抖动）推入争用崩塌；HCC 无此包装路径故仅正常小降。
+      wlC MLC meta-on 未崩（−6~9%，同 HCC），故崩塌特定于 wlB+MLC+meta-on 的交互。
+    - **处置**：按决策**暂不深究**（元数据缓存对谁都无益，不值得为它优化 MLC 查询热路径）。
+      记为潜在缺陷：**MLC 每次查询开销在"查询量放大"时会成为瓶颈**（与 t128 高并发场景
+      同源）；若将来确需支持元数据缓存或更高查询放大，须先 profile 并优化 MLC Lookup 热路径
+      争用（可复用定位生成器锁的 dwarf-callgraph 手法）。
+
+23. **【已定论，2026-08-05】"并发争用 bug 前提下叠加的小优化"复审 → 两项在干净 harness
+    重验：lazy 模式去掉、realization credit band 保留但非承重**
+    - **背景**：许多 MLC 小优化的立论踩在两个已修 bug 上——(a) YCSB
+      `ScrambledZipfianGenerator` 全局锁护航（污染**高线程吞吐**，commit `c168f5f` 修）、
+      (b) 共享 RNG 数据竞争（污染**命中率**，~6/13 修）。判据：护航只污染高线程吞吐；
+      **靠命中率或低线程吞吐立论的优化免疫**。据此，只有"唯一立论为修高线程吞吐崩塌 /
+      热路径 CPU"的旋钮是冗余嫌疑。核心 allocator（in-flight 过滤、donor retention、
+      usage-aware 门等，均命中率驱动）无需动。收敛闸早已 revert。
+    - **已被证伪并回退的行为项**：`score_credit_floor_frac` 0.25→0.5 的**提升**
+      （commit `c3905a356` 回退回 0.25）：原立论 wlA 2G t64 **+4.4% 吞吐**在干净 harness
+      不复现（配对仅 +1.1%，噪声内），是护航假象。floor**机制本身**保留。
+    - **D 类干净复验（配对中位数 + 每臂 3 repeat 离散度作噪声带；脚本
+      `scripts/analyze_dclass_ablation.py`）**：
+      - **stall-adaptive lazy mode → 默认关闭**（commit `47e7906f5`）。目标 regime（低线程
+        读多、已收敛）配对 `lazy-{on,off}-0804`（wlC/D × t8/16 × 2/8G × 3rep × 20M）：
+        geomean ON/OFF **+0.77%**，全在噪声带内，fg 中性（|Δfg|<0.5pt），且 2 个 wlD cell
+        反而 lazy-off 更快（1/8 ghost 降采样拖慢 read-latest 热集跟踪）。→"回收 1–6% 开销"
+        不复现，去掉降采样/漂移机制（6 个旋钮），保留为 ablation 选项。
+      - **realization credit band（`score_credit_frac` cap + `score_credit_floor_frac`
+        floor）→ 保留现状默认，但非承重**。两轮：`creditband-{on,off}-0804`（wlA 2G，
+        t32/64，100M）geomean **−1.85%**（t32 band 开还掉 0.68pt fg，OFF 赢；t64 中性）；
+        `creditband2-{on,off}-0805`（wlA/F × 4/8G × t64 × 3rep × 100M）geomean **+1.63%**
+        （wlF 4G ON 赢，余噪声）。**合起来是净 wash**：小缓存/低线程略亏、大缓存略赚，
+        所有 cell fg 变化 <0.4pt。原立论（~3pt fg、+4.4% via stall）是护航假象、彻底不
+        复现。**但 band 不像 lazy 有害**，在论文主打 4-8G t64 regime 微正，说明其它 churn
+        控制（usage-aware 门、sustained-data cap、donor retention）已把它想做的活干了——
+        **band 冗余但无害**。因是核心打分代码、临论文冻结前不为一个 wash 动它冒回归风险，
+        故保留默认；**论文中不作为卖点**。
+    - **仍默认 OFF / inert 的 ablation 死旋钮**（`comp_value_weight`、significance gate
+      `ghost_min_recv_donor_ratio`、`ghost_normalize_by_uncached`、`ghost_dist_decompress_max`、
+      `compaction_shift_*`、`max_interval_backoff`、`min_active_level_capacity_bytes`）：
+      运行时零开销、对论文配置零行为影响，仅是设计面复杂度。**决定延后到实验全部跑完、
+      代码冻结时作专门清理 pass**（那时删错也不影响已出数据）。
+
 ## 二、Wrapper（ARC/Cacheus）分片设计的边界点
 
 实现：`cache/sharded_wrapper_cache.*`、`cache/wrapper_cache_shard.h`，
